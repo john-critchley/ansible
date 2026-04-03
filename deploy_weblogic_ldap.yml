@@ -43,6 +43,8 @@
     ldap_admin_dn:  "cn=admin,dc=critchley,dc=biz"
     ldap_admin_pass: ldappass
     ldap_base:      "dc=critchley,dc=biz"
+    controller_ldap_tunnel: "{{ (enable_controller_ldap_tunnel | default(false) | string | lower) in ['1', 'true', 'yes', 'on'] }}"
+    controller_ldap_tunnel_port: "{{ ldap_tunnel_local_port | default(1389) }}"
     # Architecture-specific JDK settings (set from ansible_architecture)
     # x86_64: Oracle JDK .deb from oracle.com
     # aarch64: OpenJDK 21 from apt (Oracle don't ship an ARM .deb)
@@ -730,6 +732,30 @@
       changed_when: "'Opened' in sg_result.stdout"
       failed_when: false
       tags: [aws]
+
+    - name: Setup optional controller LDAP tunnel for demo lookups
+      when: controller_ldap_tunnel
+      delegate_to: localhost
+      become: no
+      tags: [aws, verify]
+      block:
+        - name: Check whether local LDAP tunnel port is already listening
+          shell: >
+            ss -ltn '( sport = :{{ controller_ldap_tunnel_port }} )' | grep -q LISTEN
+          register: ldap_tunnel_listen
+          changed_when: false
+          failed_when: false
+
+        - name: Start LDAP SSH tunnel from controller to target host
+          command: >
+            ssh -fN -L {{ controller_ldap_tunnel_port }}:localhost:389 {{ target_hostname }}
+          when: ldap_tunnel_listen.rc != 0
+
+        - name: Report controller LDAP tunnel details
+          debug:
+            msg: >-
+              Controller LDAP tunnel ready: ldap://127.0.0.1:{{ controller_ldap_tunnel_port }}
+              -> {{ target_hostname }}:389 (use LDAP_URI for local Perl app demos).
 
     # ── 15. Verify ────────────────────────────────────────────────────────────
 
