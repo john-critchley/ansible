@@ -149,6 +149,11 @@
     ssh_pubkey_epam_path: /home/john/.ssh/id_ed25519_epam.pub
     remove_sudo_raw: "{{ remove_sudo | default('no') }}"
     remove_sudo_bool: "{{ remove_sudo_raw | lower in ['yes', 'true', '1'] }}"
+    weekday_stage_root: /home/john/ansible/staged_weekday/john
+    weekday_sync_root: /home/john/ansible/weekday/john
+    weekday_overlay_files:
+      - weblogic_auth_app.pl
+      - cpanfile
 
   tasks:
     - name: Read local SSH public key
@@ -255,6 +260,16 @@
           - python3-pip
           - libssl-dev
         state: present
+
+    - name: Overlay tracked weekday files before rsync
+      delegate_to: localhost
+      become: no
+      copy:
+        src: "{{ weekday_stage_root }}/{{ item }}"
+        dest: "{{ weekday_sync_root }}/{{ item }}"
+        mode: preserve
+      loop: "{{ weekday_overlay_files }}"
+      run_once: true
 
 #    - name: Copy .bashrc to john home
 #      become: no

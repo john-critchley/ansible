@@ -1,0 +1,14 @@
+requires 'JSON';
+requires 'LWP::UserAgent';
+requires 'LWP::Protocol::https';   # HTTPS support for LWP
+requires 'HTTP::Request';
+requires 'HTTP::Tiny';
+requires 'URI';
+requires 'Mojolicious';
+requires 'File::Slurp';
+requires 'Crypt::JWT';
+requires 'Net::LDAP';
+
+on test => sub {
+    requires 'Test::More';
+};
