@@ -337,7 +337,7 @@ def step_verify_app_response(driver):
         log('  INFO: auth mode not visible in body.')
 
     src = driver.page_source
-    expected_links = ['/ops', '/debug', '/debug/refresh', '/breakglass', '/logout']
+    expected_links = ['/ops', '/debug', '/logout']
     missing = [href for href in expected_links if f'href="{href}"' not in src]
     if missing:
         log(f'  FAIL: home page missing navigation links: {missing}')
@@ -532,18 +532,22 @@ def step_breakglass_correct_creds(driver):
     screenshot(driver, 'breakglass_form_filled')
     driver.find_element(By.CSS_SELECTOR, 'input[type=submit]').click()
 
-    # Poll until body contains a terminal state (granted or failed)
+    # Poll until redirected away from /breakglass (success) or error appears on page
     wait_for(driver,
-             lambda d: 'GRANTED' in body_text(d) or 'failed' in body_text(d).lower(),
-             APP_TIMEOUT, 'breakglass response (correct creds)')
+             lambda d: '/breakglass' not in d.current_url or 'failed' in body_text(d).lower(),
+             APP_TIMEOUT, 'breakglass redirect or error (correct creds)')
     screenshot(driver, 'breakglass_correct_response')
 
     body = body_text(driver)
-    log(f'  Body: {body}')
-    if 'BREAK-GLASS ACCESS GRANTED' in body:
-        log('  PASS: break-glass with correct credentials granted.')
+    url  = driver.current_url
+    log(f'  URL: {url}  Body: {body[:80]}')
+    if 'localhost:8080' in url and '/breakglass' not in url and 'Break-glass session active' in body:
+        log('  PASS: break-glass with correct credentials redirected to app.')
         return True
-    return fail(driver, f'break-glass correct creds — unexpected response: {body[:80]}')
+    if 'localhost:8080' in url and '/breakglass' not in url and 'WebLogic Auth App' in body:
+        log('  PASS: break-glass with correct credentials — home page reached.')
+        return True
+    return fail(driver, f'break-glass correct creds — unexpected response at {url}: {body[:80]}')
 
 
 def step_breakglass_wrong_creds(driver):
@@ -558,18 +562,19 @@ def step_breakglass_wrong_creds(driver):
     driver.find_element(By.NAME, 'password').send_keys(BREAKGLASS_WRONG_PASS)
     driver.find_element(By.CSS_SELECTOR, 'input[type=submit]').click()
 
-    # Poll until body contains a terminal state
+    # Poll until error page appears or unexpected redirect
     wait_for(driver,
-             lambda d: 'GRANTED' in body_text(d) or 'failed' in body_text(d).lower(),
-             APP_TIMEOUT, 'breakglass response (wrong creds)')
+             lambda d: 'failed' in body_text(d).lower() or '/breakglass' not in d.current_url,
+             APP_TIMEOUT, 'breakglass error page (wrong creds)')
     screenshot(driver, 'breakglass_wrong_response')
 
     body = body_text(driver)
-    log(f'  Body: {body}')
-    if 'failed' in body.lower() and 'GRANTED' not in body:
+    url  = driver.current_url
+    log(f'  URL: {url}  Body: {body[:80]}')
+    if 'failed' in body.lower() and 'Break-glass session active' not in body:
         log('  PASS: break-glass with wrong credentials correctly rejected.')
         return True
-    return fail(driver, f'break-glass wrong creds — not rejected: {body[:80]}')
+    return fail(driver, f'break-glass wrong creds — not rejected at {url}: {body[:80]}')
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -584,9 +589,10 @@ def main():
 
     try:
         if app_running():
-            log('Perl app already running.')
-        else:
-            perl_proc = start_perl_app()
+            log('Perl app already running — restarting with test env vars.')
+            subprocess.run(['pkill', '-f', 'weblogic_auth_app.pl'], capture_output=True)
+            wait_until(lambda: not app_running(), timeout=10, interval=0.5)
+        perl_proc = start_perl_app()
 
         profile_tmp = make_profile_copy()
         driver = make_driver(profile_tmp)

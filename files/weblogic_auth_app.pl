@@ -151,6 +151,9 @@ sub check_auth {
     my $c = shift;
 
     if ($c->session('email')) {
+        # Break-glass sessions have no Google id_token — skip JWT refresh.
+        return 1 if ($c->session('auth_method') // '') eq 'breakglass';
+
         my ($ok, $why) = ensure_fresh_id_token($c);
         return 1 if $ok;
 
@@ -328,33 +331,79 @@ sub route_breakglass_auth {
 
     my $res = $tx->result;
     if ($res->is_success) {
-        return $c->render(text =>
-            "BREAK-GLASS ACCESS GRANTED\n" .
-            "==========================\n" .
-            "User:     $user\n" .
-            "Auth:     Basic (local WebLogic DefaultAuthenticator)\n" .
-            "Endpoint: $url\n\n" .
-            "WebLogic responded HTTP " . $res->code . " -- server is accessible.\n"
+        $c->session(
+            email       => $user,
+            name        => "Break-glass: $user",
+            auth_method => 'breakglass',
         );
+        my $dest = delete $c->session->{redirect_to} // '/';
+        return $c->redirect_to($dest);
     }
 
-    return $c->render(status => $res->code || 502, text =>
-        "Break-glass auth failed (HTTP " . ($res->code || 502) . ")\n" .
-        "User: $user\n"
+    return $c->render(status => $res->code || 502, format => 'html', text =>
+        sprintf(<<'HTML', $res->code || 502, html_escape($user))
+<!DOCTYPE html><html><head><title>Break-Glass Failed</title></head>
+<body style="font-family:monospace;max-width:480px;margin:60px auto">
+<h1 style="color:#c00">Break-Glass Login Failed</h1>
+<p>HTTP %s &mdash; credentials rejected.</p>
+<p>User: <strong>%s</strong></p>
+<p><a href="/breakglass">Try again</a> &nbsp; <a href="/login">Back to login</a></p>
+</body></html>
+HTML
     );
+}
+
+sub _render_home_breakglass {
+    my ($c, $email, $name) = @_;
+    my $html = sprintf(<<'HTML', html_escape($name), html_escape($email));
+<!DOCTYPE html>
+<html>
+<head>
+    <title>WebLogic Auth App</title>
+    <style>
+        body { font-family: monospace; max-width: 900px; margin: 30px auto; line-height: 1.4; }
+        .panel { border: 1px solid #ccc; border-radius: 6px; padding: 14px; margin-bottom: 14px; }
+        .warn { background: #fff3cd; border: 1px solid #ffc107; }
+        .nav a { display: inline-block; margin: 6px 10px 0 0; padding: 6px 10px; border: 1px solid #333; text-decoration: none; color: #111; }
+    </style>
+</head>
+<body>
+    <h1>WebLogic Auth App</h1>
+    <div class="panel warn">
+        <p><strong>&#9888; Break-glass session active.</strong></p>
+        <p>Authenticated locally via WebLogic DefaultAuthenticator (Basic auth).<br>
+        Google OAuth2 was not used. JWT asserter was not involved.</p>
+    </div>
+    <div class="panel">
+        <p><strong>User:</strong> %s</p>
+        <p><strong>Identity:</strong> %s</p>
+    </div>
+    <div class="panel nav">
+        <h3>Navigation</h3>
+        <a href="/ops">Operations Control</a>
+        <a href="/logout">Logout</a>
+    </div>
+</body>
+</html>
+HTML
+    $c->render(format => 'html', text => $html);
 }
 
 # route_home
 sub route_home {
     my $c = shift;
 
+    my $email = $c->session('email') // 'unknown';
+    my $name  = $c->session('name')  // 'unknown';
+
+    if (($c->session('auth_method') // '') eq 'breakglass') {
+        return _render_home_breakglass($c, $email, $name);
+    }
+
     my ($token_ok, $token_why) = ensure_fresh_id_token($c);
     if (!$token_ok) {
         return $c->render(status => 401, text => "Google token expired and refresh failed: $token_why\nPlease log in again.\n");
     }
-
-    my $email = $c->session('email') // 'unknown';
-    my $name = $c->session('name') // 'unknown';
 
     my ($ok, $status, $body, $auth_mode, $auth_hint) = call_weblogic($c, $creds->{weblogic_url});
 
@@ -754,6 +803,12 @@ sub ops_status {
         && $email ne ''
         && lc($email) eq lc($breakglass_audit_email)
     ) ? 1 : 0;
+
+    # Break-glass session: authenticated directly to WebLogic DefaultAuthenticator.
+    # Assign breakglass_ops unless the user also matches platform_admin.
+    if (!$is_platform_admin && ($c->session('auth_method') // '') eq 'breakglass') {
+        $is_breakglass_ops = 1;
+    }
 
     my $role = 'viewer';
     $role = 'platform_admin' if $is_platform_admin;
