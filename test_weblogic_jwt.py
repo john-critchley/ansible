@@ -18,7 +18,6 @@ import json
 import shutil
 import subprocess
 import sys
-import tempfile
 import urllib.parse
 import urllib.request
 from datetime import datetime
@@ -40,7 +39,8 @@ CREDS_JSON      = os.path.expanduser(
 )
 APP_URL         = 'http://localhost:8080/'
 APP_PORT        = 8080
-FIREFOX_PROFILE = os.path.expanduser('~/.mozilla/firefox/0tckkbwo.default-esr-1')
+FIREFOX_PROFILE      = os.path.expanduser('~/.mozilla/firefox/0tckkbwo.default-esr-1')
+FIREFOX_PROFILE_COPY = os.path.expanduser('~/ansible/tmp/ff_profile_copy')
 
 BREAKGLASS_USER = 'breakglass'
 BREAKGLASS_PASS = 'Br3akGl@ss1'
@@ -105,14 +105,29 @@ def start_perl_app():
     return proc
 
 
-def make_profile_copy():
-    tmp = tempfile.mkdtemp(prefix='ff_profile_')
-    log(f'Copying Firefox profile to {tmp} ...')
-    shutil.copytree(FIREFOX_PROFILE, tmp, dirs_exist_ok=True,
+def profile_copy_ok(path):
+    """Return True if a usable profile copy exists at path."""
+    return (
+        os.path.isdir(path)
+        and os.path.isfile(os.path.join(path, 'prefs.js'))
+    )
+
+
+def make_profile_copy(force=False):
+    dest = FIREFOX_PROFILE_COPY
+    if not force and profile_copy_ok(dest):
+        log(f'Reusing existing Firefox profile copy at {dest}')
+        return dest
+    if os.path.exists(dest):
+        log(f'Removing stale profile copy at {dest} ...')
+        shutil.rmtree(dest, ignore_errors=True)
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    log(f'Copying Firefox profile to {dest} ...')
+    shutil.copytree(FIREFOX_PROFILE, dest,
                     ignore=shutil.ignore_patterns('lock', 'parent.lock',
                                                   'places.sqlite-wal',
                                                   'places.sqlite-shm'))
-    return tmp
+    return dest
 
 
 def make_driver(profile_dir):
@@ -580,10 +595,15 @@ def step_breakglass_wrong_creds(driver):
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    perl_proc   = None
-    profile_tmp = None
-    driver      = None
-    results     = {}
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--copy-profile', action='store_true',
+                        help='Force a fresh copy of the Firefox profile before running')
+    args = parser.parse_args()
+
+    perl_proc = None
+    driver    = None
+    results   = {}
 
     log(f'Evidence directory: {EVIDENCE}')
 
@@ -594,8 +614,8 @@ def main():
             wait_until(lambda: not app_running(), timeout=10, interval=0.5)
         perl_proc = start_perl_app()
 
-        profile_tmp = make_profile_copy()
-        driver = make_driver(profile_tmp)
+        profile_dir = make_profile_copy(force=args.copy_profile)
+        driver = make_driver(profile_dir)
 
         # Test 1: JWT flow
         ok = step_navigate_to_app(driver)
@@ -619,8 +639,6 @@ def main():
     finally:
         if driver:
             driver.quit()
-        if profile_tmp and os.path.exists(profile_tmp):
-            shutil.rmtree(profile_tmp, ignore_errors=True)
         if perl_proc:
             log('Stopping Perl app.')
             perl_proc.terminate()
