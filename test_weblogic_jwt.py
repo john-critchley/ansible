@@ -121,12 +121,17 @@ def make_profile_copy(force=False):
     if os.path.exists(dest):
         log(f'Removing stale profile copy at {dest} ...')
         shutil.rmtree(dest, ignore_errors=True)
-    os.makedirs(os.path.dirname(dest), exist_ok=True)
-    log(f'Copying Firefox profile to {dest} ...')
-    shutil.copytree(FIREFOX_PROFILE, dest,
-                    ignore=shutil.ignore_patterns('lock', 'parent.lock',
-                                                  'places.sqlite-wal',
-                                                  'places.sqlite-shm'))
+    os.makedirs(dest, exist_ok=True)
+    log(f'Building minimal Firefox profile at {dest} ...')
+    # Minimal profile: saved passwords + Google session cookies.
+    # key4.db/cert9.db = NSS key/cert databases (needed to decrypt logins.json).
+    # cookies.sqlite = Google session cookies (without these Google shows /signin/rejected).
+    # Everything else (extensions, history, cache, 2GB of places) is omitted
+    # so Firefox starts in ~2s instead of ~80s.
+    for fname in ('key4.db', 'cert9.db', 'logins.json', 'cookies.sqlite'):
+        src = os.path.join(FIREFOX_PROFILE, fname)
+        if os.path.exists(src):
+            shutil.copy2(src, dest)
     return dest
 
 
