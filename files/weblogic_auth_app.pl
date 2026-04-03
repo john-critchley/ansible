@@ -5,7 +5,7 @@ use warnings;
 use Mojolicious::Lite;
 use Mojo::UserAgent;
 use Mojo::URL;
-use Mojo::JSON qw(decode_json encode_json);
+use Mojo::JSON qw(decode_json encode_json true false);
 use Mojo::Util qw(b64_decode b64_encode);
 use File::Slurp qw(read_file);
 use Crypt::JWT qw(decode_jwt);
@@ -24,6 +24,7 @@ app->sessions->default_expiration($creds->{session_expiry});
 
 get '/callback'    => \&route_callback;
 get '/logout'      => \&route_logout;
+get '/login'       => \&route_login;
 get  '/breakglass' => \&route_breakglass_form;
 post '/breakglass' => \&route_breakglass_auth;
 
@@ -157,12 +158,12 @@ sub check_auth {
         my $dest = $c->req->url->to_abs->to_string;
         $c->session(expires => 1);
         $c->session(redirect_to => $dest);
-        $c->redirect_to(google_auth_url());
+        $c->redirect_to('/login');
         return 0;
     }
 
     $c->session(redirect_to => $c->req->url->to_abs->to_string);
-    $c->redirect_to(google_auth_url());
+    $c->redirect_to('/login');
 
     return 0;
 }
@@ -182,6 +183,44 @@ sub google_auth_url {
     );
 
     return $url->to_string;
+}
+
+# route_login
+sub route_login {
+        my $c = shift;
+        return $c->redirect_to('/') if $c->session('email');
+
+        my $google_url = google_auth_url();
+        my $html = sprintf(
+                <<'HTML',
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Sign In</title>
+    <style>
+        body { font-family: monospace; max-width: 640px; margin: 60px auto; line-height: 1.35; }
+        .panel { border: 1px solid #ccc; border-radius: 6px; padding: 16px; margin-bottom: 14px; }
+        .btn { display: inline-block; padding: 10px 14px; border: 1px solid #333; text-decoration: none; color: #111; margin-right: 8px; }
+        .btn-danger { border-color: #900; color: #900; }
+        .muted { color: #666; }
+    </style>
+</head>
+<body>
+    <h1>WebLogic Auth App</h1>
+    <div class="panel">
+        <h3>Choose Authentication Method</h3>
+        <p class="muted">Use Google OAuth for normal access, or break-glass credentials for emergency access.</p>
+        <p>
+            <a id="google-login-button" class="btn" href="%s">Authenticate with Google</a>
+            <a id="breakglass-login-link" class="btn btn-danger" href="/breakglass">Login with Break-glass User</a>
+        </p>
+    </div>
+</body>
+</html>
+HTML
+                html_escape($google_url),
+        );
+        $c->render(format => 'html', text => $html);
 }
 
 # route_callback
@@ -316,8 +355,6 @@ sub route_home {
 
     my $email = $c->session('email') // 'unknown';
     my $name = $c->session('name') // 'unknown';
-    my $groups = $c->session('ldap_groups') || [];
-    my $groups_text = (@$groups ? join(', ', @$groups) : '(none)');
 
     my ($ok, $status, $body, $auth_mode, $auth_hint) = call_weblogic($c, $creds->{weblogic_url});
 
@@ -329,13 +366,47 @@ sub route_home {
         return $c->render(status => 502, text => "WebLogic request failed (HTTP $status).\n$body\n");
     }
 
-    return $c->render(text =>
-        "Welcome $name!\n" .
-        "Email: $email\n" .
-        "LDAP groups: $groups_text\n" .
-        "\nWebLogic backend call succeeded (HTTP $status) using $auth_mode auth.\n" .
-        "Endpoint: $creds->{weblogic_url}\n"
+    my $html = sprintf(
+        <<'HTML',
+<!DOCTYPE html>
+<html>
+<head>
+    <title>WebLogic Auth App</title>
+    <style>
+        body { font-family: monospace; max-width: 900px; margin: 30px auto; line-height: 1.4; }
+        .panel { border: 1px solid #ccc; border-radius: 6px; padding: 14px; margin-bottom: 14px; }
+        .ok { color: #0a7f28; }
+        .nav a { display: inline-block; margin: 6px 10px 0 0; padding: 6px 10px; border: 1px solid #333; text-decoration: none; color: #111; }
+    </style>
+</head>
+<body>
+    <h1>WebLogic Auth App</h1>
+    <div class="panel">
+        <p><strong>Welcome:</strong> %s</p>
+        <p><strong>Email:</strong> %s</p>
+        <p class="ok"><strong>WebLogic backend call succeeded (HTTP %s) using %s auth.</strong></p>
+        <p><strong>Endpoint:</strong> %s</p>
+    </div>
+
+    <div class="panel nav">
+        <h3>Navigation</h3>
+        <a href="/ops">Operations Control</a>
+        <a href="/debug">Debug JSON</a>
+        <a href="/debug/refresh">Debug Refresh</a>
+        <a href="/breakglass">Break-glass Login</a>
+        <a href="/logout">Logout</a>
+    </div>
+</body>
+</html>
+HTML
+        html_escape($name),
+        html_escape($email),
+        html_escape($status),
+        html_escape($auth_mode),
+        html_escape($creds->{weblogic_url} // ''),
     );
+
+    return $c->render(format => 'html', text => $html);
 }
 
 sub route_ops {
@@ -471,8 +542,8 @@ sub route_ops {
         %s
     </div>
 
-    <div class="panel muted">
-    <a href="/">Back to home</a> | <a href="/debug">Debug JSON</a>
+        <div class="panel muted">
+        <a href="/">Back to home</a> | <a href="/debug">Debug JSON</a> | <a href="/logout">Logout</a>
   </div>
 </body>
 </html>
@@ -592,7 +663,56 @@ sub route_ops_action {
         force_attempt => $force_attempt ? 1 : 0,
     });
 
-    $c->render(json => $decision);
+        my $accept = lc($c->req->headers->accept // '');
+        my $want_json = (($c->param('format') // '') eq 'json') || index($accept, 'application/json') >= 0;
+        return $c->render(json => $decision) if $want_json;
+
+        my $result_text = $decision->{allowed} ? 'EXECUTED' : 'DENIED';
+        my $result_class = $decision->{allowed} ? 'ok' : 'bad';
+        my $html = sprintf(
+                <<'HTML',
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Operation Result</title>
+    <meta http-equiv="refresh" content="5;url=/ops" />
+    <style>
+        body { font-family: monospace; max-width: 900px; margin: 30px auto; line-height: 1.35; }
+        .panel { border: 1px solid #ccc; border-radius: 6px; padding: 14px; margin-bottom: 14px; }
+        .ok { color: #0a7f28; }
+        .bad { color: #a33; }
+        .muted { color: #666; }
+    </style>
+</head>
+<body>
+    <h1>Operation Result</h1>
+    <div class="panel">
+        <p><strong>Action:</strong> %s</p>
+        <p><strong>Result:</strong> <span class="%s">%s</span></p>
+        <p><strong>Reason Code:</strong> %s</p>
+        <p><strong>Decision Source:</strong> %s</p>
+        <p><strong>Message:</strong> %s</p>
+        <p><strong>Trace ID:</strong> %s</p>
+        <p><strong>Timestamp:</strong> %s</p>
+    </div>
+    <div class="panel muted">
+        <p>Returning to Operations Control in 5 seconds.</p>
+        <p><a href="/ops">Go now</a> | <a href="/logout">Logout</a></p>
+    </div>
+</body>
+</html>
+HTML
+                html_escape($action || 'unknown'),
+                $result_class,
+                html_escape($result_text),
+                html_escape($decision->{reason_code} // ''),
+                html_escape($decision->{decision_source} // ''),
+                html_escape($decision->{message} // ''),
+                html_escape($decision->{trace_id} // ''),
+                html_escape($decision->{timestamp} // ''),
+        );
+
+        $c->render(format => 'html', text => $html);
 }
 
 sub ops_status {
@@ -794,8 +914,8 @@ sub set_security_debug {
     return (0, $start->code || 500, 'Failed to start edit session') unless $start->is_success;
 
     my $set = $ua->post("$base/edit/servers/AdminServer/serverDebug" => mgmt_headers() => json => {
-        debugSecurityAtn => $enabled ? 1 : 0,
-        debugSecurityAtz => $enabled ? 1 : 0,
+        debugSecurityAtn => $enabled ? true : false,
+        debugSecurityAtz => $enabled ? true : false,
     })->result;
     if (!$set->is_success) {
         my $cancel = $ua->post("$base/edit/changeManager/cancelEdit" => mgmt_headers() => json => {})->result;
@@ -810,7 +930,16 @@ sub set_security_debug {
     }
 
     my $state = $enabled ? 'ON' : 'OFF';
-    return (1, $activate->code || 200, "Security debug toggled $state");
+    for (1..12) {
+        my ($seen_enabled, $flags_text, $seen_state) = mgmt_security_debug_status();
+        if (($enabled && $seen_enabled) || (!$enabled && !$seen_enabled)) {
+            return (1, $activate->code || 200, "Security debug toggled $state ($flags_text)");
+        }
+        select(undef, undef, undef, 0.5);
+    }
+
+    my ($final_enabled, $final_flags_text, $final_state) = mgmt_security_debug_status();
+    return (0, 500, "Security debug state mismatch after activate: expected $state, saw $final_state ($final_flags_text)");
 }
 
 sub mgmt_base_url {

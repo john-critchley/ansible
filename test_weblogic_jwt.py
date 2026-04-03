@@ -32,8 +32,8 @@ from selenium.webdriver.support.ui import WebDriverWait
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-# Local runs execute directly from staged_weekday as the source of truth.
-PERL_APP        = os.path.expanduser('~/ansible/staged_weekday/john/weblogic_auth_app.pl')
+# Local runs execute from the dedicated WebLogic source file.
+PERL_APP        = os.path.expanduser('~/ansible/files/weblogic_auth_app.pl')
 CREDS_JSON      = os.path.expanduser(
     '~/Desktop/client_secret_1048362443290-'
     '2b5qj413ojqmhnapn36ih59j0m6bl2b3.apps.googleusercontent.com.json'
@@ -161,7 +161,7 @@ def body_text(driver):
 
 def post_ops_action_http(driver, action, extra=None):
     cookie_header = '; '.join(f"{c['name']}={c['value']}" for c in driver.get_cookies())
-    payload = {'action': action}
+    payload = {'action': action, 'format': 'json'}
     if extra:
         payload.update(extra)
     data = urllib.parse.urlencode(payload).encode('utf-8')
@@ -171,6 +171,7 @@ def post_ops_action_http(driver, action, extra=None):
         method='POST',
         headers={
             'Content-Type': 'application/x-www-form-urlencoded',
+            'Accept': 'application/json',
             'Cookie': cookie_header,
         },
     )
@@ -192,9 +193,21 @@ def step_navigate_to_app(driver):
     log(f'[1] Navigating to {APP_URL}')
     driver.get(APP_URL)
 
+    wait_for(driver,
+             lambda d: 'localhost:8080' in d.current_url or 'accounts.google.com' in d.current_url,
+             APP_TIMEOUT, 'post-app navigation redirect')
+
+    if '/login' in driver.current_url:
+        login_btn = wait_for(driver,
+                             EC.element_to_be_clickable((By.ID, 'google-login-button')),
+                             APP_TIMEOUT, 'google auth button on login choice page')
+        if not login_btn:
+            return fail(driver, 'google auth button missing on /login page')
+        screenshot(driver, 'login_choice_page')
+        login_btn.click()
+
     el = wait_for(driver, EC.url_contains('accounts.google.com'),
                   APP_TIMEOUT, 'redirect to Google')
-
     if not el and 'accounts.google.com' not in driver.current_url:
         if 'localhost:8080' in driver.current_url:
             log('  OAuth completed silently (Google still logged in). Fresh token acquired.')
@@ -386,47 +399,78 @@ def step_ops_controls(driver):
     rotate_btn.click()
 
     wait_for(driver,
-             lambda d: 'reason_code' in body_text(d) or 'Log rotation triggered' in body_text(d),
-             APP_TIMEOUT, 'rotate log response')
+             lambda d: 'Operation Result' in body_text(d),
+             APP_TIMEOUT, 'rotate log result page')
     screenshot(driver, 'ops_rotate_response')
     rotate_body = body_text(driver)
     log(f'  /ops/action rotate response: {rotate_body}')
-    if 'executed' not in rotate_body or 'Log rotation triggered' not in rotate_body:
+    if 'Result: EXECUTED' not in rotate_body or 'Log rotation triggered' not in rotate_body:
         return fail(driver, 'rotate_log action did not execute successfully')
+    if 'Returning to Operations Control in 5 seconds.' not in rotate_body:
+        return fail(driver, 'ops action page missing delayed redirect message')
 
-    driver.get('http://localhost:8080/ops')
+    wait_for(driver,
+             lambda d: 'localhost:8080/ops' in d.current_url,
+             APP_TIMEOUT, 'return to /ops after rotate action')
+
     wait_for(driver,
              lambda d: 'Security Debug' in body_text(d),
              APP_TIMEOUT, 'ops page for debug toggle')
     screenshot(driver, 'ops_before_debug_toggle')
 
-    btn = wait_for(driver,
-                   EC.element_to_be_clickable((By.XPATH, '//button[contains(text(),"Security Debug")]')),
-                   APP_TIMEOUT, 'security debug toggle button')
-    if not btn:
-        return fail(driver, 'security debug toggle button not available')
+    before_ops = body_text(driver)
+    if 'Security debug: OFF' in before_ops:
+        first_action = 'security_debug_on'
+        expected_after_first = 'ON'
+        expected_after_restore = 'OFF'
+    elif 'Security debug: ON' in before_ops:
+        first_action = 'security_debug_off'
+        expected_after_first = 'OFF'
+        expected_after_restore = 'ON'
+    else:
+        return fail(driver, 'unable to determine initial security debug state from /ops page')
 
-    btn.click()
-    wait_for(driver,
-             lambda d: 'reason_code' in body_text(d) or 'Security debug toggled' in body_text(d),
-             APP_TIMEOUT, 'security debug toggle response')
+    try:
+        first_resp = post_ops_action_http(driver, first_action)
+    except Exception as exc:
+        return fail(driver, f'first security debug toggle request failed: {exc}')
     screenshot(driver, 'ops_debug_toggle_1')
-    first_resp = body_text(driver)
     log(f'  /ops/action debug response #1: {first_resp}')
-    if 'executed' not in first_resp:
+    if 'executed' not in first_resp and 'already_in_requested_state' not in first_resp:
         return fail(driver, 'first security debug toggle failed')
 
-    restore_action = 'security_debug_off' if 'ON' in first_resp else 'security_debug_on'
+    def wait_for_ops_state(expected_state, description):
+        import time
+        deadline = time.monotonic() + APP_TIMEOUT
+        last_body = ''
+        while time.monotonic() < deadline:
+            driver.get('http://localhost:8080/ops')
+            wait_for(driver,
+                     lambda d: 'Security Debug' in body_text(d),
+                     APP_TIMEOUT, f'ops page content ({description})')
+            last_body = body_text(driver)
+            if f'Security debug: {expected_state}' in last_body:
+                return last_body
+            time.sleep(1)
+        return None
+
+    after_first_page = wait_for_ops_state(expected_after_first, 'after first toggle')
+    if not after_first_page:
+        return fail(driver, f'ops page did not reflect first debug state ({expected_after_first})')
+
+    restore_action = 'security_debug_off' if first_action == 'security_debug_on' else 'security_debug_on'
     try:
         second_resp = post_ops_action_http(driver, restore_action)
     except Exception as exc:
         return fail(driver, f'security debug restore request failed: {exc}')
 
-    driver.get('http://localhost:8080/ops')
+    after_restore_page = wait_for_ops_state(expected_after_restore, 'after restore toggle')
     screenshot(driver, 'ops_after_debug_restore')
     log(f'  /ops/action debug response #2: {second_resp}')
     if 'executed' not in second_resp and 'already_in_requested_state' not in second_resp:
         return fail(driver, 'second security debug toggle failed')
+    if not after_restore_page:
+        return fail(driver, f'ops page did not reflect restored debug state ({expected_after_restore})')
 
     log('  PASS: /ops actions executed and security debug was restored.')
     return True
