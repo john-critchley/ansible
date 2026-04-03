@@ -5,12 +5,13 @@ use warnings;
 use Mojolicious::Lite;
 use Mojo::UserAgent;
 use Mojo::URL;
-use Mojo::JSON qw(decode_json);
+use Mojo::JSON qw(decode_json encode_json);
 use Mojo::Util qw(b64_decode b64_encode);
 use File::Slurp qw(read_file);
 use Crypt::JWT qw(decode_jwt);
 use Net::LDAP;
 use Net::LDAP::Util qw(escape_filter_value);
+use Fcntl qw(:flock);
 
 # Canonical perl-auth flow assembled in order from Derek/perl-auth.
 # Basic WebLogic integration is wired in route_home via call_weblogic().
@@ -341,6 +342,7 @@ sub route_ops {
     my $c = shift;
 
     my $ops = ops_status($c);
+    my $recent_events = read_recent_ops_audit_events(12);
     my $status_color = $ops->{mgmt_ok} ? '#0a7f28' : '#7a7a7a';
     my $status_text = $ops->{mgmt_ok} ? 'Reachable' : 'Unavailable';
     my $action_disabled = $ops->{can_rotate} ? '' : 'disabled';
@@ -361,6 +363,31 @@ sub route_ops {
         );
     }
 
+    my $events_html = '<p class="muted">No audit entries yet.</p>';
+    if (ref($recent_events) eq 'ARRAY' && @$recent_events) {
+        my @rows;
+        for my $ev (@$recent_events) {
+            next unless ref($ev) eq 'HASH';
+            my $result = ($ev->{decision} // '') eq 'executed' ? 'EXECUTED' : 'DENIED';
+            my $cls = ($ev->{decision} // '') eq 'executed' ? 'ok' : 'bad';
+            push @rows, sprintf(
+                '<tr><td>%s</td><td>%s</td><td>%s</td><td class="%s">%s</td><td>%s</td><td>%s</td></tr>',
+                html_escape($ev->{timestamp} // ''),
+                html_escape($ev->{trace_id} // ''),
+                html_escape($ev->{role} // ''),
+                $cls,
+                html_escape($result),
+                html_escape($ev->{action} // ''),
+                html_escape($ev->{message} // ''),
+            );
+        }
+        if (@rows) {
+            $events_html = '<table><thead><tr><th>Time</th><th>Trace</th><th>Role</th><th>Decision</th><th>Action</th><th>Message</th></tr></thead><tbody>'
+                . join('', @rows)
+                . '</tbody></table>';
+        }
+    }
+
     my $html = sprintf(
         <<'HTML',
 <!DOCTYPE html>
@@ -377,6 +404,9 @@ sub route_ops {
     .btn:disabled { background: #ddd; color: #888; border-color: #aaa; cursor: not-allowed; }
     .btn-danger { padding: 8px 14px; border: 1px solid #900; background: #c62828; color: #fff; cursor: pointer; }
     .hint { margin-top: 8px; color: #666; }
+        table { width: 100%; border-collapse: collapse; font-size: 12px; }
+        th, td { border: 1px solid #ddd; padding: 6px; text-align: left; vertical-align: top; }
+        th { background: #f5f5f5; }
   </style>
 </head>
 <body>
@@ -415,6 +445,11 @@ sub route_ops {
   </div>
 
   <div class="panel muted">
+        <h3>Recent Policy Decisions</h3>
+        %s
+    </div>
+
+    <div class="panel muted">
     <a href="/">Back to home</a> | <a href="/debug">Debug JSON</a>
   </div>
 </body>
@@ -436,6 +471,7 @@ HTML
         $action_disabled,
         html_escape($action_hint),
         html_escape($action_hint),
+        $events_html,
     );
 
     $c->render(format => 'html', text => $html);
@@ -458,9 +494,9 @@ sub route_ops_action {
     };
 
     if ($action eq 'rotate_log') {
-        if (!$ops->{is_platform_admin}) {
-            $decision->{reason_code} = 'not_platform_admin';
-            $decision->{message} = 'Requires Platform Admin identity';
+        if (!$ops->{can_rotate}) {
+            $decision->{reason_code} = 'role_not_permitted';
+            $decision->{message} = $ops->{rotate_reason};
         } elsif (!$ops->{mgmt_ok}) {
             $decision->{decision_source} = 'service-availability';
             $decision->{reason_code} = 'mgmt_unavailable';
@@ -472,9 +508,9 @@ sub route_ops_action {
             $decision->{message} = 'Action allowed by backend policy';
         }
     } elsif ($action eq 'security_debug_on' || $action eq 'security_debug_off') {
-        if (!$ops->{is_platform_admin}) {
-            $decision->{reason_code} = 'not_platform_admin';
-            $decision->{message} = 'Requires Platform Admin identity';
+        if (!$ops->{can_set_debug}) {
+            $decision->{reason_code} = 'role_not_permitted';
+            $decision->{message} = $ops->{set_debug_reason};
         } elsif (!$ops->{mgmt_ok}) {
             $decision->{decision_source} = 'service-availability';
             $decision->{reason_code} = 'mgmt_unavailable';
@@ -518,6 +554,19 @@ sub route_ops_action {
         trace_id => ($decision->{trace_id} || ''),
     });
 
+    append_ops_audit_event({
+        timestamp => ($decision->{timestamp} || ''),
+        trace_id  => ($decision->{trace_id} || ''),
+        action    => $action,
+        role      => ($ops->{role} || 'unknown'),
+        email     => ($ops->{email} || ''),
+        decision  => ($decision->{allowed} ? 'executed' : 'denied'),
+        reason_code => ($decision->{reason_code} || ''),
+        source    => ($decision->{decision_source} || ''),
+        message   => ($decision->{message} || ''),
+        force_attempt => $force_attempt ? 1 : 0,
+    });
+
     $c->render(json => $decision);
 }
 
@@ -525,26 +574,66 @@ sub ops_status {
     my ($c) = @_;
 
     my $email = $c->session('email') // '';
+    my $groups = $c->session('ldap_groups') || [];
     my $platform_admin_email = $ENV{PLATFORM_ADMIN_EMAIL} || 'johnsrcritchley@gmail.com';
-    my $is_platform_admin = ($email ne '' && lc($email) eq lc($platform_admin_email)) ? 1 : 0;
-    my $role = $is_platform_admin ? 'platform_admin' : 'viewer';
+    my $breakglass_ops_email = $ENV{BREAKGLASS_OPS_EMAIL} || '';
+    my $breakglass_audit_email = $ENV{BREAKGLASS_AUDIT_EMAIL} || '';
+
+    my $in_admin_group = 0;
+    if (ref($groups) eq 'ARRAY') {
+        for my $g (@$groups) {
+            next unless defined $g;
+            if (lc($g) eq 'administrators') {
+                $in_admin_group = 1;
+                last;
+            }
+        }
+    }
+
+    my $is_platform_admin = (
+        ($email ne '' && lc($email) eq lc($platform_admin_email))
+        || $in_admin_group
+    ) ? 1 : 0;
+
+    my $is_breakglass_ops = (
+        !$is_platform_admin
+        && $breakglass_ops_email ne ''
+        && $email ne ''
+        && lc($email) eq lc($breakglass_ops_email)
+    ) ? 1 : 0;
+
+    my $is_breakglass_audit = (
+        !$is_platform_admin
+        && !$is_breakglass_ops
+        && $breakglass_audit_email ne ''
+        && $email ne ''
+        && lc($email) eq lc($breakglass_audit_email)
+    ) ? 1 : 0;
+
+    my $role = 'viewer';
+    $role = 'platform_admin' if $is_platform_admin;
+    $role = 'breakglass_ops' if $is_breakglass_ops;
+    $role = 'breakglass_audit' if $is_breakglass_audit;
 
     my ($mgmt_ok, $mgmt_reason, $last_rotation) = mgmt_runtime_status();
     my ($debug_enabled, $debug_flags_text, $debug_state) = mgmt_security_debug_status();
 
-    my $can_rotate = 1;
-    my $rotate_reason = 'Rotate AdminServer log now';
-    my $can_set_debug = 1;
-    my $set_debug_reason = 'Toggle security debug flags';
-    if (!$is_platform_admin) {
+    my $can_rotate = ($is_platform_admin || $is_breakglass_ops) ? 1 : 0;
+    my $rotate_reason = $can_rotate ? 'Rotate AdminServer log now' : 'Requires platform_admin or breakglass_ops role';
+    my $can_set_debug = $is_platform_admin ? 1 : 0;
+    my $set_debug_reason = $can_set_debug ? 'Toggle security debug flags' : 'Requires platform_admin role';
+
+    if (!$can_rotate && $is_breakglass_audit) {
+        $rotate_reason = 'breakglass_audit is read-only';
+    }
+    if (!$can_set_debug && $is_breakglass_audit) {
+        $set_debug_reason = 'breakglass_audit is read-only';
+    }
+
+    if (!$mgmt_ok) {
         $can_rotate = 0;
-        $rotate_reason = 'Requires Platform Admin identity';
         $can_set_debug = 0;
-        $set_debug_reason = 'Requires Platform Admin identity';
-    } elsif (!$mgmt_ok) {
-        $can_rotate = 0;
         $rotate_reason = $mgmt_reason || 'WebLogic management unavailable';
-        $can_set_debug = 0;
         $set_debug_reason = $mgmt_reason || 'WebLogic management unavailable';
     }
 
@@ -563,6 +652,47 @@ sub ops_status {
         can_set_debug => $can_set_debug,
         set_debug_reason => $set_debug_reason,
     };
+}
+
+sub ops_audit_log_path {
+    return $ENV{OPS_AUDIT_LOG} || "$ENV{HOME}/ansible/weekday/john/ops_audit.log.jsonl";
+}
+
+sub append_ops_audit_event {
+    my ($event) = @_;
+    return unless ref($event) eq 'HASH';
+
+    my $path = ops_audit_log_path();
+    return unless $path;
+
+    if (open(my $fh, '>>', $path)) {
+        flock($fh, LOCK_EX);
+        print {$fh} encode_json($event) . "\n";
+        flock($fh, LOCK_UN);
+        close($fh);
+    }
+}
+
+sub read_recent_ops_audit_events {
+    my ($limit) = @_;
+    $limit = 10 unless defined $limit && $limit =~ /^\d+$/;
+    my $path = ops_audit_log_path();
+    return [] unless $path && -f $path;
+
+    open(my $fh, '<', $path) or return [];
+    my @lines = <$fh>;
+    close($fh);
+
+    my $count = scalar(@lines);
+    my $start = $count > $limit ? ($count - $limit) : 0;
+    my @events;
+    for my $line (@lines[$start .. $#lines]) {
+        chomp($line);
+        next if $line eq '';
+        my $obj = eval { decode_json($line) };
+        push @events, $obj if ref($obj) eq 'HASH';
+    }
+    return [ reverse @events ];
 }
 
 sub mgmt_security_debug_status {

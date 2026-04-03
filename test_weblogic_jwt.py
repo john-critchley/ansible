@@ -18,6 +18,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import urllib.parse
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 
@@ -150,6 +152,22 @@ def body_text(driver):
         return driver.find_element(By.TAG_NAME, 'body').text
     except Exception:
         return ''
+
+
+def post_ops_action_http(driver, action):
+    cookie_header = '; '.join(f"{c['name']}={c['value']}" for c in driver.get_cookies())
+    data = urllib.parse.urlencode({'action': action}).encode('utf-8')
+    req = urllib.request.Request(
+        'http://localhost:8080/ops/action',
+        data=data,
+        method='POST',
+        headers={
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'Cookie': cookie_header,
+        },
+    )
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        return resp.read().decode('utf-8', errors='replace')
 
 
 # ── Test 1: JWT flow ──────────────────────────────────────────────────────────
@@ -330,6 +348,73 @@ def step_token_refresh(driver):
     return fail(driver, 'token refresh endpoint did not report success')
 
 
+def step_ops_controls(driver):
+    log('[3c] Operations controls check via /ops')
+    driver.get('http://localhost:8080/ops')
+
+    wait_for(driver,
+             lambda d: 'WebLogic Operations Control' in body_text(d),
+             APP_TIMEOUT, 'ops page content')
+    screenshot(driver, 'ops_page')
+
+    page = body_text(driver)
+    if 'WebLogic Operations Control' not in page:
+        return fail(driver, 'ops page did not render correctly')
+
+    rotate_btn = wait_for(driver,
+                          EC.element_to_be_clickable((By.XPATH, '//button[contains(text(),"Rotate AdminServer Log")]')),
+                          APP_TIMEOUT, 'rotate log button')
+    if not rotate_btn:
+        return fail(driver, 'rotate log button not available')
+    rotate_btn.click()
+
+    wait_for(driver,
+             lambda d: 'reason_code' in body_text(d) or 'Log rotation triggered' in body_text(d),
+             APP_TIMEOUT, 'rotate log response')
+    screenshot(driver, 'ops_rotate_response')
+    rotate_body = body_text(driver)
+    log(f'  /ops/action rotate response: {rotate_body}')
+    if 'executed' not in rotate_body or 'Log rotation triggered' not in rotate_body:
+        return fail(driver, 'rotate_log action did not execute successfully')
+
+    driver.get('http://localhost:8080/ops')
+    wait_for(driver,
+             lambda d: 'Security Debug' in body_text(d),
+             APP_TIMEOUT, 'ops page for debug toggle')
+    screenshot(driver, 'ops_before_debug_toggle')
+
+    btn = wait_for(driver,
+                   EC.element_to_be_clickable((By.XPATH, '//button[contains(text(),"Security Debug")]')),
+                   APP_TIMEOUT, 'security debug toggle button')
+    if not btn:
+        return fail(driver, 'security debug toggle button not available')
+
+    btn.click()
+    wait_for(driver,
+             lambda d: 'reason_code' in body_text(d) or 'Security debug toggled' in body_text(d),
+             APP_TIMEOUT, 'security debug toggle response')
+    screenshot(driver, 'ops_debug_toggle_1')
+    first_resp = body_text(driver)
+    log(f'  /ops/action debug response #1: {first_resp}')
+    if 'executed' not in first_resp:
+        return fail(driver, 'first security debug toggle failed')
+
+    restore_action = 'security_debug_off' if 'ON' in first_resp else 'security_debug_on'
+    try:
+        second_resp = post_ops_action_http(driver, restore_action)
+    except Exception as exc:
+        return fail(driver, f'security debug restore request failed: {exc}')
+
+    driver.get('http://localhost:8080/ops')
+    screenshot(driver, 'ops_after_debug_restore')
+    log(f'  /ops/action debug response #2: {second_resp}')
+    if 'executed' not in second_resp and 'already_in_requested_state' not in second_resp:
+        return fail(driver, 'second security debug toggle failed')
+
+    log('  PASS: /ops actions executed and security debug was restored.')
+    return True
+
+
 # ── Test 2 & 3: Break-glass ───────────────────────────────────────────────────
 
 def step_breakglass_correct_creds(driver):
@@ -410,6 +495,7 @@ def main():
             ok = step_google_login(driver)
         results['jwt'] = ok and step_verify_app_response(driver)
         results['token_refresh'] = results['jwt'] and step_token_refresh(driver)
+        results['ops_controls'] = results['token_refresh'] and step_ops_controls(driver)
 
         # Tests 2 & 3: break-glass
         results['breakglass_correct'] = step_breakglass_correct_creds(driver)
