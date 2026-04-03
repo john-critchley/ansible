@@ -1,0 +1,16 @@
+#!/usr/bin/bash
+action=$1; shift
+case $action in
+start)
+        for rc in /etc/rcs/*
+        do
+                [ -x "$rc" ] && $rc start
+        done
+        ;;
+stop)
+        for rc in /etc/rcs/*
+        do
+                [ -x "$rc" ] && $rc stop
+        done
+        ;;
+esac

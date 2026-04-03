@@ -1,0 +1,246 @@
+---
+- name: AWS host lifecycle management and configuration
+  hosts: all
+  gather_facts: no
+  vars:
+    startup_timeout: 300  # 5 minutes, can be overridden with -e startup_timeout=600
+    udp_client_script: "{{ playbook_dir }}/files/udp_client.py"
+  
+  tasks:
+    # Determine AWS region from group membership
+    - name: Determine AWS region for host
+      set_fact:
+        aws_region: "{{ item }}"
+      when: item in group_names and item in ['ap-southeast-1', 'us-east-1', 'us-west-2']
+      loop:
+        - ap-southeast-1
+        - us-east-1
+        - us-west-2
+      delegate_to: localhost
+    
+    - name: Verify host is in exactly one region group
+      assert:
+        that:
+          - aws_region is defined
+        fail_msg: "Host {{ inventory_hostname }} must be in exactly one region group (ap-southeast-1, us-east-1, or us-west-2)"
+      delegate_to: localhost
+    
+    - name: Check for multiple region group membership
+      fail:
+        msg: "Host {{ inventory_hostname }} is in multiple region groups - this should never happen"
+      when: group_names | intersect(['ap-southeast-1', 'us-east-1', 'us-west-2']) | length > 1
+      delegate_to: localhost
+    
+    # Get instance ID from UDP service
+    - name: Get AWS instance ID via UDP service (canon command)
+      command: "{{ udp_client_script }} canon {{ inventory_hostname_short }}"
+      register: canon_result
+      delegate_to: localhost
+      changed_when: false
+    
+    - name: Parse canon response
+      set_fact:
+        instance_id: "{{ canon_result.stdout | regex_search('message=(.+)', '\\1') | first }}"
+      delegate_to: localhost
+    
+    # Check current host state
+    - name: Check current host state via UDP service (get command)
+      command: "{{ udp_client_script }} get {{ instance_id }}"
+      register: get_result
+      delegate_to: localhost
+      changed_when: false
+      failed_when: false
+    
+    - name: Parse get response
+      set_fact:
+        host_status: "{{ get_result.stdout | regex_search('status=(.)', '\\1') | first }}"
+      delegate_to: localhost
+    
+    - name: Store original host state
+      set_fact:
+        original_state: "{{ 'disabled' if host_status == 'D' else 'enabled' }}"
+        needs_startup: "{{ host_status == 'D' }}"
+      delegate_to: localhost
+    
+    # Start instance if needed
+    - name: Start AWS instance if disabled
+      block:
+        - name: Start EC2 instance
+          community.aws.ec2_instance:
+            instance_ids:
+              - "{{ instance_id }}"
+            state: running
+            region: "{{ aws_region }}"
+            wait: yes
+          register: ec2_start
+          delegate_to: localhost
+        
+        - name: Get instance information
+          community.aws.ec2_instance_info:
+            instance_ids:
+              - "{{ instance_id }}"
+            region: "{{ aws_region }}"
+          register: ec2_info
+          delegate_to: localhost
+        
+        - name: Store instance IP
+          set_fact:
+            instance_ip: "{{ ec2_info.instances[0].public_ip_address }}"
+          delegate_to: localhost
+        
+        - name: Update hosts file via UDP service (host command)
+          command: "{{ udp_client_script }} host {{ instance_id }} {{ instance_ip }}"
+          register: host_update_result
+          delegate_to: localhost
+        
+        - name: Save hosts file via UDP service (save command)
+          command: "{{ udp_client_script }} save"
+          register: save_result
+          delegate_to: localhost
+        
+        - name: Wait for SSH to become available
+          wait_for:
+            host: "{{ inventory_hostname }}"
+            port: 22
+            delay: 10
+            timeout: "{{ startup_timeout }}"
+            state: started
+          delegate_to: localhost
+      
+      when: needs_startup | bool
+    
+    # Now gather facts after host is confirmed up
+    - name: Gather facts
+      setup:
+    
+    # Main configuration tasks
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+      become: yes
+
+    - name: Upgrade apt packages
+      apt:
+        upgrade: dist
+        autoremove: yes
+        autoclean: yes
+      become: yes
+    
+    - name: Install standard packages
+      apt:
+        name: "{{ lookup('file', 'files/manual-packages.txt').splitlines() }}"
+        state: present
+      become: yes
+      when: lookup('file', 'files/manual-packages.txt', errors='ignore')
+    
+    - name: Remove unattended-upgrades
+      apt:
+        name: unattended-upgrades
+        state: absent
+        purge: yes
+      become: yes
+    
+    - name: Remove apparmor
+      apt:
+        name:
+          - apparmor
+          - apparmor-utils
+        state: absent
+        purge: yes
+      become: yes
+    
+    - name: Set hostname to short name
+      hostname:
+        name: "{{ inventory_hostname_short }}"
+        use: systemd
+      become: yes
+    
+    - name: Update /etc/hosts with new hostname
+      lineinfile:
+        path: /etc/hosts
+        regexp: '^127\.0\.1\.1'
+        line: "127.0.1.1 {{ inventory_hostname_short }}"
+        state: present
+      become: yes
+    
+    - name: Create /etc/rcs directory
+      file:
+        path: /etc/rcs
+        state: directory
+        mode: '0755'
+      become: yes
+    
+    - name: Install /etc/rc.local
+      copy:
+        src: files/rc.local
+        dest: /etc/rc.local
+        mode: '0755'
+      become: yes
+    
+    - name: Install /etc/rcs/setdns script
+      copy:
+        src: files/setdns
+        dest: /etc/rcs/setdns
+        mode: '0755'
+      become: yes
+    
+    - name: Ensure /etc/rc.local runs at boot (systemd service)
+      copy:
+        dest: /etc/systemd/system/rc-local.service
+        content: |
+          [Unit]
+          Description=/etc/rc.local
+          ConditionPathExists=/etc/rc.local
+          After=network.target
+          
+          [Service]
+          Type=forking
+          ExecStart=/etc/rc.local start
+          ExecStop=/etc/rc.local stop
+          TimeoutSec=0
+          RemainAfterExit=yes
+          GuessMainPID=no
+          
+          [Install]
+          WantedBy=multi-user.target
+      become: yes
+    
+    - name: Enable rc-local service
+      systemd:
+        name: rc-local
+        enabled: yes
+        daemon_reload: yes
+      become: yes
+
+# Cleanup - restore original state
+- name: Restore original host states
+  hosts: all
+  gather_facts: no
+  vars:
+    udp_client_script: "{{ playbook_dir }}/files/udp_client.py"
+  
+  tasks:
+    - name: Shutdown hosts that were originally disabled
+      block:
+        - name: Stop EC2 instance
+          community.aws.ec2_instance:
+            instance_ids:
+              - "{{ instance_id }}"
+            state: stopped
+            region: "{{ aws_region }}"
+            wait: yes
+          register: ec2_stop
+          delegate_to: localhost
+        
+        - name: Disable host in hosts file via UDP service (disable command)
+          command: "{{ udp_client_script }} disable {{ instance_id }}"
+          register: disable_result
+          delegate_to: localhost
+        
+        - name: Save hosts file via UDP service (save command)
+          command: "{{ udp_client_script }} save"
+          register: save_cleanup_result
+          delegate_to: localhost
+      
+      when: original_state == 'disabled'

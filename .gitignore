@@ -1,0 +1,22 @@
+# Scratch files
+A
+p
+t.sh
+notes
+launch_instance.yml_
+
+# Test evidence (screenshots, logs)
+test-evidence/
+
+# Personal dotfiles rsync'd to remote hosts — contains .bash_history, .claude.json, .npmrc etc
+weekday/
+
+# Embedded git repo — not a submodule
+ansible-roles/
+
+# Ansible retry files
+*.retry
+
+# Python cache
+__pycache__/
+*.pyc

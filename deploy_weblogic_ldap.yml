@@ -1,0 +1,729 @@
+---
+# Deploy WebLogic 14.1.2 + OpenLDAP + LDAP authentication
+# Based on the Derek/DB proof of concept lab
+#
+# Usage:
+#   ansible-playbook deploy_weblogic_ldap.yml -e "target=<hostname> wls_admin_pass=<password>"
+# Password must meet WLS policy: >=8 chars, at least one digit or special char.
+#
+# WLS JAR: Google Drive file ID hardcoded (1rmgNfzgfQwj2WQZxAHZDtgbWcQaiBK5c)
+# Override with -e "wls_gdrive_id=<id>" if the file is re-uploaded.
+#
+# Remote Console access (no extra ports needed):
+#   ssh -L 7001:localhost:7001 -L 7002:localhost:7002 <target>
+#   Then point Remote Console at http://localhost:7001
+#
+# Built-in help:
+#   ansible-playbook deploy_weblogic_ldap.yml -e "help=yes"
+# LDAP-only rerun on an already provisioned host:
+#   ansible-playbook deploy_weblogic_ldap.yml \
+#     -e "target=<hostname> wls_admin_pass=<password>" \
+#     --tags ldap-users
+
+- name: Deploy WebLogic + OpenLDAP lab
+  hosts: "{{ target | default('localhost') }}"
+  gather_facts: "{{ not ((help | default(false) | string | lower) in ['1', 'true', 'yes', 'on']) }}"
+  become: yes
+
+  vars:
+    oracle_home:  /home/john/Oracle/Middleware/Oracle_Home
+    domain_home:  /home/john/Oracle/Middleware/Oracle_Home/user_projects/domains/base_domain
+    install_dir:  /home/john/db-install
+    java_home:    ""   # detected after JDK install — see set_fact below
+    wls_admin_user: weblogic
+    wls_gdrive_id:  "1rmgNfzgfQwj2WQZxAHZDtgbWcQaiBK5c"
+    ldap_admin_dn:  "cn=admin,dc=critchley,dc=biz"
+    ldap_admin_pass: ldappass
+    ldap_base:      "dc=critchley,dc=biz"
+    # Architecture-specific JDK settings (set from ansible_architecture)
+    # x86_64: Oracle JDK .deb from oracle.com
+    # aarch64: OpenJDK 21 from apt (Oracle don't ship an ARM .deb)
+    # x86_64: Oracle JDK .deb, path detected via glob
+    # aarch64: Oracle JDK .tar.gz (no .deb available), extracted to fixed path
+    jdk_arch_map:
+      x86_64:  { method: deb,   pkg: "jdk-21_linux-x64_bin.deb",        jvm_path: "" }
+      aarch64: { method: targz, pkg: "jdk-21_linux-aarch64_bin.tar.gz",  jvm_path: "/usr/local/java/oracle-jdk21" }
+    help_requested: "{{ (help | default(false) | string | lower) in ['1', 'true', 'yes', 'on'] }}"
+
+  pre_tasks:
+
+    - name: Show playbook help
+      debug:
+        msg:
+          - "Usage: ansible-playbook deploy_weblogic_ldap.yml -e 'target=<hostname> wls_admin_pass=<password>'"
+          - "Help: ansible-playbook deploy_weblogic_ldap.yml -e 'help=yes'"
+          - "LDAP-only run: ansible-playbook deploy_weblogic_ldap.yml -e 'target=<hostname> wls_admin_pass=<password>' --tags ldap-users"
+          - "Available tags: ldap-users, ldap, weblogic, aws, verify"
+          - "Notes: ldap-users adds base LDAP entries plus johnsrcritchley and repairs Administrators membership if needed. weblogic covers Java, WebLogic install/domain/service/auth tasks. aws opens port 7001 for the controller IP. verify runs the API checks."
+      when: help_requested
+      tags: [always]
+
+    - name: Exit after showing help
+      meta: end_play
+      when: help_requested
+      tags: [always]
+
+  tasks:
+
+    # ── 0. Prepare ────────────────────────────────────────────────────────────
+
+    - name: Require wls_admin_pass to be set
+      fail:
+        msg: "Pass the WebLogic admin password: -e 'wls_admin_pass=<password>'"
+      when:
+        - (ansible_run_tags | default(['all'])) | intersect(['all', 'weblogic', 'aws', 'verify']) | length > 0
+        - wls_admin_pass is not defined or wls_admin_pass == ''
+      tags: [always]
+
+    - name: Create install directory
+      file:
+        path: "{{ install_dir }}"
+        state: directory
+        owner: john
+        mode: '0755'
+      tags: [ldap-users, weblogic]
+
+    # ── 1. Install gdown (for Google Drive downloads) ─────────────────────────
+
+    - name: Install python3-pip
+      apt:
+        name: python3-pip
+        state: present
+        update_cache: yes
+      tags: [weblogic]
+
+    - name: Install gdown
+      pip:
+        name: gdown
+        executable: pip3
+        extra_args: --break-system-packages
+      tags: [weblogic]
+
+    - name: Install Maven (required to build JWT asserter)
+      apt:
+        name: maven
+        state: present
+      tags: [weblogic, jwt-asserter]
+
+    # ── 2. Copy small files from control node ─────────────────────────────────
+
+    - name: Copy small install files
+      copy:
+        src: "/home/john/pl/DB/{{ item }}"
+        dest: "{{ install_dir }}/{{ item }}"
+        owner: john
+        mode: '0644'
+      loop:
+        - oracle_response.txt
+        - ldap-users.ldif
+        - add-john.ldif
+        - testauth1.pl
+      tags: [ldap-users, weblogic]
+
+    - name: Copy WLST scripts
+      copy:
+        src: "files/{{ item }}"
+        dest: "{{ install_dir }}/{{ item }}"
+        owner: john
+        mode: '0644'
+      loop:
+        - create_domain.py
+        - config_ldap.py
+        - config_jwt_asserter.py
+        - deploy_testapp.py
+      tags: [weblogic, jwt-asserter, testapp]
+
+    - name: Copy JWT asserter source tree to target
+      copy:
+        src: "files/jwt-asserter/"
+        dest: "{{ install_dir }}/jwt-asserter/"
+        owner: john
+        mode: preserve
+      tags: [weblogic, jwt-asserter]
+
+    # ── 3. Download large binaries on target ──────────────────────────────────
+
+    - name: Download Oracle JDK 21 (x86 — .deb)
+      get_url:
+        url: "https://download.oracle.com/java/21/latest/{{ jdk_arch_map[ansible_architecture].pkg }}"
+        dest: "{{ install_dir }}/{{ jdk_arch_map[ansible_architecture].pkg }}"
+        mode: '0644'
+        timeout: 600
+      register: jdk_download
+      until: jdk_download is succeeded
+      retries: 3
+      delay: 10
+      when: jdk_arch_map[ansible_architecture].method == 'deb'
+      tags: [weblogic]
+
+    - name: Download Oracle JDK 21 (ARM — .tar.gz)
+      get_url:
+        url: "https://download.oracle.com/java/21/latest/{{ jdk_arch_map[ansible_architecture].pkg }}"
+        dest: "{{ install_dir }}/{{ jdk_arch_map[ansible_architecture].pkg }}"
+        mode: '0644'
+        timeout: 600
+      register: jdk_download_arm
+      until: jdk_download_arm is succeeded
+      retries: 3
+      delay: 10
+      when: jdk_arch_map[ansible_architecture].method == 'targz'
+      tags: [weblogic]
+
+    - name: Download WebLogic JAR from Google Drive
+      command: >
+        gdown "https://drive.google.com/uc?id={{ wls_gdrive_id }}"
+        -O {{ install_dir }}/fmw_14.1.2.0.0_wls.jar
+      args:
+        creates: "{{ install_dir }}/fmw_14.1.2.0.0_wls.jar"
+      become: yes
+      become_user: john
+      tags: [weblogic]
+
+    # ── 4. Install Oracle JDK 21 ──────────────────────────────────────────────
+
+    - name: Install Oracle JDK 21 via .deb (x86)
+      apt:
+        deb: "{{ install_dir }}/{{ jdk_arch_map[ansible_architecture].pkg }}"
+      when: jdk_arch_map[ansible_architecture].method == 'deb'
+      tags: [weblogic]
+
+    - name: Create Oracle JDK install dir (ARM)
+      file:
+        path: "{{ jdk_arch_map[ansible_architecture].jvm_path }}"
+        state: directory
+        mode: '0755'
+      when: jdk_arch_map[ansible_architecture].method == 'targz'
+      tags: [weblogic]
+
+    - name: Extract Oracle JDK 21 tar.gz (ARM)
+      unarchive:
+        src: "{{ install_dir }}/{{ jdk_arch_map[ansible_architecture].pkg }}"
+        dest: "{{ jdk_arch_map[ansible_architecture].jvm_path }}"
+        remote_src: yes
+        extra_opts: ['--strip-components=1']
+        creates: "{{ jdk_arch_map[ansible_architecture].jvm_path }}/bin/java"
+      when: jdk_arch_map[ansible_architecture].method == 'targz'
+      tags: [weblogic]
+
+    - name: Set java_home fact (x86 — detect via glob)
+      shell: "ls -d /usr/lib/jvm/jdk-*-oracle-x64 | tail -1"
+      register: jdk_path_result
+      changed_when: false
+      when: jdk_arch_map[ansible_architecture].method == 'deb'
+      tags: [weblogic, jwt-asserter, testapp]
+
+    - name: Set java_home fact from glob result (x86)
+      set_fact:
+        java_home: "{{ jdk_path_result.stdout }}"
+      when: jdk_arch_map[ansible_architecture].method == 'deb'
+      tags: [weblogic, jwt-asserter, testapp]
+
+    - name: Set java_home fact (ARM — fixed path)
+      set_fact:
+        java_home: "{{ jdk_arch_map[ansible_architecture].jvm_path }}"
+      when: jdk_arch_map[ansible_architecture].method == 'targz'
+      tags: [weblogic, jwt-asserter, testapp]
+
+    - name: Set JAVA_HOME system-wide
+      lineinfile:
+        path: /etc/environment
+        regexp: '^JAVA_HOME='
+        line: "JAVA_HOME={{ java_home }}"
+        create: yes
+      tags: [weblogic]
+
+    # ── 5. Install and configure OpenLDAP ─────────────────────────────────────
+    # Pre-seed BEFORE apt install so slapd postinst reads correct values.
+    # debconf-utils must be installed first for debconf module to work.
+
+    - name: Install debconf-utils (needed before slapd preseed)
+      apt:
+        name: debconf-utils
+        state: present
+      tags: [ldap, ldap-users]
+
+    - name: Pre-seed slapd configuration
+      debconf:
+        name: slapd
+        question: "{{ item.question }}"
+        value: "{{ item.value }}"
+        vtype: "{{ item.vtype }}"
+      loop:
+        - { question: 'slapd/no_configuration', value: 'false',        vtype: 'boolean'  }
+        - { question: 'slapd/domain',            value: 'critchley.biz', vtype: 'string' }
+        - { question: 'shared/organization',     value: 'winterbourne', vtype: 'string'  }
+        - { question: 'slapd/password1',         value: 'ldappass',     vtype: 'password' }
+        - { question: 'slapd/password2',         value: 'ldappass',     vtype: 'password' }
+        - { question: 'slapd/backend',           value: 'MDB',          vtype: 'select'   }
+        - { question: 'slapd/purge_database',    value: 'false',        vtype: 'boolean'  }
+        - { question: 'slapd/move_old_database', value: 'true',         vtype: 'boolean'  }
+      tags: [ldap, ldap-users]
+
+    - name: Install OpenLDAP packages
+      apt:
+        name:
+          - slapd
+          - ldap-utils
+          - libnet-ldap-perl
+        state: present
+      tags: [ldap, ldap-users]
+
+    - name: Ensure slapd is started and enabled
+      systemd:
+        name: slapd
+        state: started
+        enabled: yes
+      tags: [ldap, ldap-users]
+
+    - name: Wait for LDAP to accept connections (pre-check)
+      wait_for:
+        port: 389
+        host: localhost
+        timeout: 30
+      tags: [ldap, ldap-users]
+
+    - name: Test slapd admin bind (verify domain + password correct)
+      command: >
+        ldapsearch -x -H ldap://localhost
+        -D "{{ ldap_admin_dn }}" -w {{ ldap_admin_pass }}
+        -b "{{ ldap_base }}" -s base
+      register: slapd_admin_check
+      changed_when: false
+      failed_when: false
+      tags: [ldap, ldap-users]
+
+    - name: Reconfigure slapd if admin bind failed
+      command: dpkg-reconfigure -f noninteractive slapd
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+      when: slapd_admin_check.rc != 0
+      tags: [ldap, ldap-users]
+
+    - name: Restart slapd after reconfigure
+      systemd:
+        name: slapd
+        state: restarted
+      when: slapd_admin_check.rc != 0
+      tags: [ldap, ldap-users]
+
+    - name: Wait for LDAP to accept connections
+      wait_for:
+        port: 389
+        host: localhost
+        timeout: 30
+      tags: [ldap, ldap-users]
+
+    # ── 6. Load LDAP directory structure ──────────────────────────────────────
+
+    - name: Check if LDAP Administrators group already exists
+      command: >
+        ldapsearch -x -H ldap://localhost
+        -b "{{ ldap_base }}" "(cn=Administrators)" dn
+      register: ldap_check
+      changed_when: false
+      failed_when: false
+      tags: [ldap-users]
+
+    - name: Load LDAP users and groups
+      command: >
+        ldapadd -x -D "{{ ldap_admin_dn }}" -w {{ ldap_admin_pass }}
+        -f {{ install_dir }}/ldap-users.ldif
+      when: "'dn: cn=Administrators' not in ldap_check.stdout"
+      tags: [ldap-users]
+
+    - name: Check if LDAP john user already exists
+      command: >
+        ldapsearch -x -H ldap://localhost
+        -b "ou=users,ou=winterbourne,dc=critchley,dc=biz" "(uid=johnsrcritchley)" dn
+      register: ldap_john_check
+      changed_when: false
+      failed_when: false
+      tags: [ldap-users]
+
+    - name: Load john LDAP user and group membership
+      command: >
+        ldapadd -x -D "{{ ldap_admin_dn }}" -w {{ ldap_admin_pass }}
+        -f {{ install_dir }}/add-john.ldif
+      when: "'dn: uid=johnsrcritchley,ou=users,ou=winterbourne,dc=critchley,dc=biz' not in ldap_john_check.stdout"
+      tags: [ldap-users]
+
+    - name: Check if john is already in LDAP Administrators group
+      command: >
+        ldapsearch -x -H ldap://localhost
+        -b "ou=groups,ou=winterbourne,dc=critchley,dc=biz"
+        "(member=uid=johnsrcritchley,ou=users,ou=winterbourne,dc=critchley,dc=biz)" dn
+      register: ldap_john_group_check
+      changed_when: false
+      failed_when: false
+      tags: [ldap-users]
+
+    - name: Ensure john is in LDAP Administrators group
+      shell: |
+        cat <<'EOF' | ldapmodify -x -D "{{ ldap_admin_dn }}" -w {{ ldap_admin_pass }}
+        dn: cn=Administrators,ou=groups,ou=winterbourne,dc=critchley,dc=biz
+        changetype: modify
+        add: member
+        member: uid=johnsrcritchley,ou=users,ou=winterbourne,dc=critchley,dc=biz
+        EOF
+      when: "'dn: cn=Administrators,ou=groups,ou=winterbourne,dc=critchley,dc=biz' not in ldap_john_group_check.stdout"
+      tags: [ldap-users]
+
+    # ── 7. Create swap (WebLogic installer requires >512MB) ──────────────────
+
+    - name: Check current swap
+      command: swapon --show
+      register: swap_check
+      changed_when: false
+      failed_when: false
+      tags: [weblogic]
+
+    - name: Create 1GB swap file
+      command: dd if=/dev/zero of=/swapfile bs=1M count=1024
+      args:
+        creates: /swapfile
+      when: swap_check.stdout == ''
+      tags: [weblogic]
+
+    - name: Set swap file permissions
+      file:
+        path: /swapfile
+        mode: '0600'
+      when: swap_check.stdout == ''
+      tags: [weblogic]
+
+    - name: Format swap file
+      command: mkswap /swapfile
+      when: swap_check.stdout == ''
+      tags: [weblogic]
+
+    - name: Enable swap
+      command: swapon /swapfile
+      when: swap_check.stdout == ''
+      tags: [weblogic]
+
+    # ── 8. Install WebLogic Server (silent) ───────────────────────────────────
+
+    - name: Create Oracle inventory directory
+      file:
+        path: /home/john/oraInventory
+        state: directory
+        owner: john
+        mode: '0755'
+      tags: [weblogic]
+
+    - name: Get john's primary group name
+      command: id -gn john
+      register: john_group
+      changed_when: false
+      tags: [weblogic]
+
+    - name: Create /etc/oraInst.loc (Oracle inventory pointer)
+      copy:
+        dest: /etc/oraInst.loc
+        content: |
+          inventory_loc=/home/john/oraInventory
+          inst_group={{ john_group.stdout }}
+        mode: '0644'
+      tags: [weblogic]
+
+    - name: Create temp dir for installer extraction
+      file:
+        path: /home/john/tmp
+        state: directory
+        owner: john
+        mode: '0755'
+      tags: [weblogic]
+
+    - name: Install WebLogic Server
+      command: >
+        {{ java_home }}/bin/java
+        -Djava.io.tmpdir=/home/john/tmp
+        -jar {{ install_dir }}/fmw_14.1.2.0.0_wls.jar
+        -silent -responseFile {{ install_dir }}/oracle_response.txt
+      args:
+        creates: "{{ oracle_home }}/wlserver"
+      become: yes
+      become_user: john
+      environment:
+        JAVA_HOME: "{{ java_home }}"
+        _JAVA_OPTIONS: "-Djava.awt.headless=true"
+      timeout: 1200
+      tags: [weblogic]
+
+    # ── 8b. Build and deploy JWT Identity Asserter JAR ───────────────────────
+    # Build happens after WebLogic install so weblogic.jar is available.
+    # JAR is copied to mbeantypes/ before domain creation so WebLogic starts
+    # with the provider class already visible — only one restart needed later.
+
+    - name: Build Google JWT Identity Asserter JAR
+      command: bash {{ install_dir }}/jwt-asserter/build.sh
+      become: yes
+      become_user: john
+      environment:
+        WLS_HOME: "{{ oracle_home }}/wlserver"
+        JAVA_HOME: "{{ java_home }}"
+      tags: [weblogic, jwt-asserter]
+
+    - name: Deploy JWT asserter provider JAR to WebLogic mbeantypes
+      copy:
+        src: "{{ install_dir }}/jwt-asserter/target/google-jwt-asserter-1.0.jar"
+        dest: "{{ oracle_home }}/wlserver/server/lib/mbeantypes/google-jwt-asserter-1.0.jar"
+        owner: john
+        mode: '0644'
+        remote_src: yes
+      tags: [weblogic, jwt-asserter]
+
+    - name: Deploy JWT asserter MBean metadata JAR to WebLogic mbeantypes
+      copy:
+        src: "{{ install_dir }}/jwt-asserter/target/google-jwt-asserter-1.0-mjf.jar"
+        dest: "{{ oracle_home }}/wlserver/server/lib/mbeantypes/google-jwt-asserter-1.0-mjf.jar"
+        owner: john
+        mode: '0644'
+        remote_src: yes
+      tags: [weblogic, jwt-asserter]
+
+    # ── 9. Create WebLogic domain (WLST offline) ──────────────────────────────
+
+    - name: Create WebLogic domain
+      command: >
+        {{ oracle_home }}/oracle_common/common/bin/wlst.sh
+        {{ install_dir }}/create_domain.py
+      args:
+        creates: "{{ domain_home }}/config/config.xml"
+      become: yes
+      become_user: john
+      environment:
+        JAVA_HOME: "{{ java_home }}"
+        _JAVA_OPTIONS: "-Djava.awt.headless=true"
+        WLS_ADMIN_PASS: "{{ wls_admin_pass }}"
+      timeout: 300
+      tags: [weblogic]
+
+    # ── 10. Install systemd service + start WebLogic ─────────────────────────
+
+    - name: Install WebLogic systemd service unit
+      copy:
+        dest: /etc/systemd/system/weblogic.service
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=WebLogic AdminServer
+          After=network.target slapd.service
+          Wants=slapd.service
+
+          [Service]
+          Type=simple
+          User=john
+          Environment=JAVA_HOME={{ java_home }}
+          Environment=_JAVA_OPTIONS=-Djava.awt.headless=true
+          ExecStart={{ domain_home }}/bin/startWebLogic.sh
+          ExecStop={{ domain_home }}/bin/stopWebLogic.sh {{ wls_admin_user }} {{ wls_admin_pass }}
+          Restart=on-failure
+          RestartSec=30
+          StandardOutput=append:/var/log/weblogic.log
+          StandardError=append:/var/log/weblogic.log
+
+          [Install]
+          WantedBy=multi-user.target
+      tags: [weblogic]
+
+    - name: Enable WebLogic service (reload systemd)
+      systemd:
+        name: weblogic
+        enabled: yes
+        daemon_reload: yes
+      tags: [weblogic]
+
+    - name: Start WebLogic via systemd (first time)
+      systemd:
+        name: weblogic
+        state: started
+      tags: [weblogic]
+
+    - name: Wait for WebLogic port 7001
+      wait_for:
+        port: 7001
+        host: localhost
+        timeout: 300
+        state: started
+      tags: [weblogic]
+
+    # ── 11. Configure LDAP authenticator (WLST online) ────────────────────────
+
+    - name: Check if LDAPAuth already in domain config
+      command: grep -q LDAPAuth {{ domain_home }}/config/config.xml
+      register: ldapauth_check
+      failed_when: false
+      changed_when: false
+      tags: [weblogic]
+
+    - name: Configure LDAP authenticator via WLST
+      command: >
+        {{ oracle_home }}/oracle_common/common/bin/wlst.sh
+        {{ install_dir }}/config_ldap.py
+      become: yes
+      become_user: john
+      environment:
+        JAVA_HOME: "{{ java_home }}"
+        _JAVA_OPTIONS: "-Djava.awt.headless=true"
+        WLS_ADMIN_PASS: "{{ wls_admin_pass }}"
+      when: ldapauth_check.rc != 0
+      timeout: 120
+      tags: [weblogic]
+
+    # ── 11b. Configure Google JWT Identity Asserter (WLST online) ────────────
+
+    - name: Check if JWT asserter fully configured (including ActiveTypes)
+      command: grep -q "active-type>Bearer" {{ domain_home }}/config/config.xml
+      register: jwt_asserter_check
+      failed_when: false
+      changed_when: false
+      tags: [weblogic, jwt-asserter]
+
+    - name: Configure JWT asserter via WLST
+      command: >
+        {{ oracle_home }}/oracle_common/common/bin/wlst.sh
+        {{ install_dir }}/config_jwt_asserter.py
+      become: yes
+      become_user: john
+      environment:
+        JAVA_HOME: "{{ java_home }}"
+        _JAVA_OPTIONS: "-Djava.awt.headless=true"
+        WLS_ADMIN_PASS: "{{ wls_admin_pass }}"
+        JWT_AUDIENCE: "1048362443290-2b5qj413ojqmhnapn36ih59j0m6bl2b3.apps.googleusercontent.com"
+      when: jwt_asserter_check.rc != 0
+      timeout: 120
+      tags: [weblogic, jwt-asserter]
+
+    # ── 12. Restart WebLogic via systemd to activate LDAP + JWT config ───────
+
+    - name: Restart WebLogic via systemd (activates LDAP and/or JWT config)
+      systemd:
+        name: weblogic
+        state: restarted
+      when: (ldapauth_check is defined and ldapauth_check.rc != 0) or jwt_asserter_check.rc != 0
+      tags: [weblogic, jwt-asserter]
+
+    - name: Start WebLogic via systemd (if not already running)
+      systemd:
+        name: weblogic
+        state: started
+      when: ldapauth_check.rc == 0 and jwt_asserter_check.rc == 0
+      tags: [weblogic]
+
+    - name: Wait for WebLogic to start
+      wait_for:
+        port: 7001
+        host: localhost
+        timeout: 300
+        state: started
+      tags: [weblogic]
+
+    # ── 13. Deploy testapp WAR ───────────────────────────────────────────────
+
+    - name: Copy testapp WAR to target
+      copy:
+        src: files/testapp.war
+        dest: "{{ install_dir }}/testapp.war"
+        owner: john
+        mode: '0644'
+      tags: [weblogic, testapp]
+
+    - name: Copy deploy_testapp WLST script
+      copy:
+        src: files/deploy_testapp.py
+        dest: "{{ install_dir }}/deploy_testapp.py"
+        owner: john
+        mode: '0644'
+      tags: [weblogic, testapp]
+
+    - name: Check if testapp already deployed
+      command: >
+        grep -q "<name>testapp</name>"
+        {{ domain_home }}/config/config.xml
+      register: testapp_check
+      failed_when: false
+      changed_when: false
+      tags: [weblogic, testapp]
+
+    - name: Deploy testapp via WLST
+      shell: >
+        export JAVA_HOME="{{ java_home }}" &&
+        export WLS_ADMIN_PASS="{{ wls_admin_pass }}" &&
+        export TESTAPP_WAR="{{ install_dir }}/testapp.war" &&
+        {{ oracle_home }}/oracle_common/common/bin/wlst.sh
+        {{ install_dir }}/deploy_testapp.py
+      become: no
+      when: testapp_check.rc != 0
+      timeout: 120
+      tags: [weblogic, testapp]
+
+    # ── 14. Open port 7001 in security group for controller IP ───────────────
+
+    - name: Store target hostname for delegate_to tasks
+      set_fact:
+        target_hostname: "{{ inventory_hostname }}"
+
+    - name: Get controller public IP
+      uri:
+        url: https://checkip.amazonaws.com
+        return_content: yes
+      delegate_to: localhost
+      become: no
+      register: controller_ip
+      tags: [aws]
+
+    - name: Open port 7001 to controller IP in security group
+      command: >
+        ~/aws/aws_open_port.py {{ target_hostname }}
+        7001 {{ controller_ip.content | trim }}
+        --region eu-central-1
+      delegate_to: localhost
+      become: no
+      register: sg_result
+      changed_when: "'Opened' in sg_result.stdout"
+      failed_when: false
+      tags: [aws]
+
+    # ── 15. Verify ────────────────────────────────────────────────────────────
+
+    - name: Verify external access via public IP (testuser)
+      uri:
+        url: "http://{{ target_hostname }}:7001/management/weblogic/latest"
+        url_username: testuser
+        url_password: test123
+        validate_certs: no
+        status_code: 200
+        timeout: 10
+      delegate_to: localhost
+      become: no
+      register: ext_verify
+      retries: 3
+      delay: 5
+      until: ext_verify.status == 200
+      tags: [verify]
+
+    - name: Verify LDAP auth via WebLogic REST API (testuser)
+      uri:
+        url: http://localhost:7001/management/weblogic/latest
+        url_username: testuser
+        url_password: test123
+        validate_certs: no
+        status_code: 200
+        timeout: 30
+      register: verify_result
+      retries: 12
+      delay: 15
+      until: verify_result.status == 200
+      tags: [verify]
+
+    - name: Report deployment success
+      debug:
+        msg: >-
+          WebLogic + OpenLDAP deployed successfully.
+          LDAP user testuser authenticated locally (HTTP {{ verify_result.status }}) and externally (HTTP {{ ext_verify.status }}).
+          WebLogic admin: {{ wls_admin_user }} / {{ wls_admin_pass }}
+          LDAP testuser: testuser / test123
+          Public URL: http://{{ ansible_host }}:7001/management/weblogic/latest
+          Admin log: {{ domain_home }}/servers/AdminServer/logs/AdminServer.log
+      tags: [verify]

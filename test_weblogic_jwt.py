@@ -1,0 +1,341 @@
+#!/usr/bin/env python3
+"""
+End-to-end test: Google OAuth2 login → Perl app → WebLogic JWT asserter.
+
+Runs non-interactively. Saves screenshots at every significant step.
+Screenshots written to ~/ansible/test-evidence/<timestamp>/
+Exit code 0 = pass, 1 = fail.
+"""
+
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import datetime
+from pathlib import Path
+
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.firefox.options import Options
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
+
+# ── Config ────────────────────────────────────────────────────────────────────
+
+PERL_APP        = os.path.expanduser('~/ansible/weekday/john/weblogic_auth_app.pl')
+CREDS_JSON      = os.path.expanduser(
+    '~/Desktop/client_secret_1048362443290-'
+    '2b5qj413ojqmhnapn36ih59j0m6bl2b3.apps.googleusercontent.com.json'
+)
+APP_URL         = 'http://localhost:8080/'
+APP_PORT        = 8080
+FIREFOX_PROFILE = os.path.expanduser('~/.mozilla/firefox/0tckkbwo.default-esr-1')
+
+GOOGLE_LOGIN_TIMEOUT = 60
+APP_TIMEOUT          = 30
+
+RUN_ID    = datetime.now().strftime('%Y%m%d_%H%M%S')
+EVIDENCE  = Path(os.path.expanduser(f'~/ansible/test-evidence/{RUN_ID}'))
+
+
+# ── Evidence helpers ──────────────────────────────────────────────────────────
+
+def log(msg):
+    ts = datetime.now().strftime('%H:%M:%S')
+    print(f'[{ts}] {msg}')
+
+
+def screenshot(driver, label):
+    EVIDENCE.mkdir(parents=True, exist_ok=True)
+    seq = len(list(EVIDENCE.glob('*.png'))) + 1
+    name = f'{seq:02d}_{label}.png'
+    path = EVIDENCE / name
+    driver.save_screenshot(str(path))
+    log(f'  Screenshot: {path.name}  ({driver.current_url[:70]})')
+    return path
+
+
+def fail(driver, reason):
+    log(f'FAIL: {reason}')
+    if driver:
+        screenshot(driver, 'FAIL_' + reason[:40].replace(' ', '_'))
+    return False
+
+
+# ── Setup helpers ─────────────────────────────────────────────────────────────
+
+def app_running():
+    result = subprocess.run(['ss', '-tlnp'], capture_output=True, text=True)
+    return f':{APP_PORT}' in result.stdout
+
+
+def start_perl_app():
+    log(f'Starting Perl app on port {APP_PORT}...')
+    proc = subprocess.Popen(
+        ['perl', PERL_APP, 'daemon', '-l', f'http://*:{APP_PORT}',
+         '--', '--creds', os.path.expanduser(CREDS_JSON)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    for _ in range(20):
+        time.sleep(0.5)
+        if app_running():
+            log('  Perl app ready.')
+            return proc
+    log('  ERROR: Perl app did not start in time.')
+    proc.terminate()
+    sys.exit(1)
+
+
+def make_profile_copy():
+    tmp = tempfile.mkdtemp(prefix='ff_profile_')
+    log(f'Copying Firefox profile to {tmp} ...')
+    shutil.copytree(FIREFOX_PROFILE, tmp, dirs_exist_ok=True,
+                    ignore=shutil.ignore_patterns('lock', 'parent.lock',
+                                                  'places.sqlite-wal',
+                                                  'places.sqlite-shm'))
+    return tmp
+
+
+def make_driver(profile_dir):
+    opts = Options()
+    opts.profile = profile_dir
+    opts.set_preference('dom.disable_beforeunload', True)
+    opts.set_preference('browser.tabs.warnOnClose', False)
+    opts.set_preference('signon.rememberSignons', False)
+    driver = webdriver.Firefox(options=opts)
+    driver.set_window_size(1200, 900)
+    return driver
+
+
+def wait_for(driver, condition, timeout, description):
+    try:
+        return WebDriverWait(driver, timeout).until(condition)
+    except Exception:
+        log(f'  TIMEOUT waiting for: {description}')
+        log(f'  Current URL: {driver.current_url}')
+        return None
+
+
+# ── Test steps ────────────────────────────────────────────────────────────────
+
+def step_navigate_to_app(driver):
+    log(f'[1] Clearing any existing session via /logout')
+    driver.get('http://localhost:8080/logout')
+    time.sleep(1)
+    screenshot(driver, 'after_logout')
+
+    log(f'[1] Navigating to {APP_URL}')
+    driver.get(APP_URL)
+
+    el = wait_for(driver, EC.url_contains('accounts.google.com'),
+                  APP_TIMEOUT, 'redirect to Google')
+
+    if not el and 'accounts.google.com' not in driver.current_url:
+        if 'localhost:8080' in driver.current_url:
+            # Google was already logged in — OAuth flow completed silently via
+            # the logout→/→callback round-trip. Session has a fresh id_token.
+            log('  OAuth completed silently (Google still logged in). Fresh token acquired.')
+            screenshot(driver, 'silent_oauth_complete')
+            return True
+        screenshot(driver, 'unexpected_url_after_navigate')
+        return fail(driver, f'expected Google redirect, got {driver.current_url[:60]}')
+
+    log('  Redirected to Google.')
+    screenshot(driver, 'google_redirect')
+    return True
+
+
+def step_google_login(driver):
+    log('[2] Google login')
+
+    # "Choose an account" screen
+    try:
+        choose = WebDriverWait(driver, 5).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, '[data-email]'))
+        )
+        email = choose.get_attribute('data-email')
+        log(f'  "Choose an account" — selecting {email}')
+        screenshot(driver, 'choose_account')
+        choose.click()
+        return True
+    except Exception:
+        pass
+
+    # Email input
+    email_input = wait_for(driver,
+                           EC.element_to_be_clickable(
+                               (By.CSS_SELECTOR, 'input[type="email"]')),
+                           10, 'email input')
+    if not email_input:
+        screenshot(driver, 'email_input_missing')
+        return fail(driver, 'email input not found')
+
+    email_input.clear()
+    email_input.send_keys('johnsrcritchley@gmail.com')
+    screenshot(driver, 'email_entered')
+    log('  Email entered.')
+
+    next_btn = wait_for(driver,
+                        EC.element_to_be_clickable((By.ID, 'identifierNext')),
+                        5, 'Next button')
+    if not next_btn:
+        return fail(driver, 'Next button after email not found')
+    next_btn.click()
+
+    # Password input
+    password_input = wait_for(driver,
+                              EC.element_to_be_clickable(
+                                  (By.CSS_SELECTOR, 'input[type="password"]')),
+                              10, 'password input')
+    if not password_input:
+        screenshot(driver, 'password_input_missing')
+        return fail(driver, 'password input not found')
+
+    time.sleep(1.5)
+    if password_input.get_attribute('value'):
+        log('  Password auto-filled by Firefox.')
+    else:
+        log('  Password not auto-filled — waiting up to 20s...')
+        for _ in range(20):
+            time.sleep(1)
+            if password_input.get_attribute('value'):
+                log('  Password filled.')
+                break
+        else:
+            screenshot(driver, 'password_not_filled')
+            return fail(driver, 'password not filled after 20s')
+
+    screenshot(driver, 'password_ready')
+
+    sign_in_btn = wait_for(driver,
+                           EC.element_to_be_clickable((By.ID, 'passwordNext')),
+                           5, 'Sign In button')
+    if not sign_in_btn:
+        return fail(driver, 'Sign In button not found')
+    sign_in_btn.click()
+    log('  Sign In clicked.')
+    return True
+
+
+def step_handle_oauth_consent(driver):
+    try:
+        allow = WebDriverWait(driver, 5).until(
+            EC.element_to_be_clickable((By.XPATH,
+                '//button[.//span[contains(text(),"Allow") or '
+                'contains(text(),"Continue")]]'))
+        )
+        log('[2b] OAuth consent — clicking Allow.')
+        screenshot(driver, 'oauth_consent')
+        allow.click()
+    except Exception:
+        pass
+
+
+def step_verify_app_response(driver):
+    log('[3] Waiting for return to Perl app...')
+
+    el = wait_for(driver, EC.url_contains('localhost'),
+                  GOOGLE_LOGIN_TIMEOUT, 'return to localhost after login')
+    if not el and 'localhost' not in driver.current_url:
+        screenshot(driver, 'did_not_return_to_app')
+        return fail(driver, f'still on {driver.current_url[:60]} after login')
+
+    step_handle_oauth_consent(driver)
+
+    # Wait past /callback to the final / route
+    wait_for(driver,
+             lambda d: 'localhost:8080' in d.current_url
+                       and '/callback' not in d.current_url,
+             APP_TIMEOUT, 'final app page')
+
+    screenshot(driver, 'app_home_response')
+    body = driver.find_element(By.TAG_NAME, 'body').text
+    log(f'  Body: {body}')
+
+    passed = True
+
+    if 'WebLogic backend call succeeded' in body:
+        log('  PASS: WebLogic backend call succeeded.')
+    else:
+        log('  FAIL: no success message from WebLogic.')
+        passed = False
+
+    if 'bearer' in body.lower() and 'basic-fallback' not in body.lower():
+        log('  PASS: Bearer token auth confirmed.')
+    elif 'basic-fallback' in body.lower():
+        log('  FAIL: fell back to Basic auth — JWT asserter not working.')
+        passed = False
+    else:
+        log('  INFO: auth mode not visible in body.')
+
+    # /debug endpoint
+    driver.get('http://localhost:8080/debug')
+    time.sleep(1)
+    screenshot(driver, 'debug_endpoint')
+    debug_body = driver.find_element(By.TAG_NAME, 'body').text
+    log(f'  /debug: {debug_body}')
+
+    if not passed:
+        screenshot(driver, 'FAIL_final_state')
+
+    return passed
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main():
+    perl_proc   = None
+    profile_tmp = None
+    driver      = None
+    passed      = False
+
+    log(f'Evidence directory: {EVIDENCE}')
+
+    try:
+        if app_running():
+            log('Perl app already running.')
+        else:
+            perl_proc = start_perl_app()
+
+        profile_tmp = make_profile_copy()
+        driver = make_driver(profile_tmp)
+
+        ok = step_navigate_to_app(driver)
+        if not ok:
+            return
+
+        if 'accounts.google.com' in driver.current_url:
+            ok = step_google_login(driver)
+            if not ok:
+                return
+
+        passed = step_verify_app_response(driver)
+
+    except Exception as e:
+        log(f'EXCEPTION: {e}')
+        if driver:
+            screenshot(driver, 'EXCEPTION')
+        raise
+
+    finally:
+        if driver:
+            driver.quit()
+        if profile_tmp and os.path.exists(profile_tmp):
+            shutil.rmtree(profile_tmp, ignore_errors=True)
+        if perl_proc:
+            log('Stopping Perl app.')
+            perl_proc.terminate()
+
+    if passed:
+        log('=== TEST PASSED ===')
+        sys.exit(0)
+    else:
+        log('=== TEST FAILED === (see screenshots in test-evidence/)')
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()

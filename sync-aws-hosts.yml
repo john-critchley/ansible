@@ -1,0 +1,33 @@
+---
+# Copies AWS /etc/hosts lines (where last field is an EC2 instance ID) to remote hosts.
+# Usage:
+#   ansible-playbook sync-aws-hosts.yml -i hosts.ini              # all hosts
+#   ansible-playbook sync-aws-hosts.yml -i hosts.ini -l noodle    # one host
+
+- name: Sync AWS /etc/hosts entries to remote hosts
+  hosts: all
+  become: true
+
+  vars:
+    local_hosts_lines: "{{ lookup('file', '/etc/hosts').splitlines() }}"
+    aws_hosts_lines: >-
+      {{
+        local_hosts_lines
+        | reject('match', '^\s*#')
+        | reject('match', '^\s*$')
+        | select('search', '\bi-[0-9a-f]{8,}\b')
+        | list
+      }}
+
+  tasks:
+    - name: Show AWS lines to be synced
+      debug:
+        msg: "{{ aws_hosts_lines }}"
+      run_once: true
+
+    - name: Ensure AWS host entries are present in /etc/hosts
+      blockinfile:
+        path: /etc/hosts
+        marker: "# {mark} ansible aws-hosts sync"
+        block: "{{ aws_hosts_lines | join('\n') }}"
+        backup: true

@@ -1,0 +1,117 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>biz.critchley.weblogic</groupId>
+    <artifactId>google-jwt-asserter</artifactId>
+    <version>1.0</version>
+    <packaging>jar</packaging>
+    <name>Google JWT Identity Asserter for WebLogic</name>
+
+    <properties>
+        <maven.compiler.source>17</maven.compiler.source>
+        <maven.compiler.target>17</maven.compiler.target>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <!--
+          Path to weblogic.jar. build.sh passes this via -DweblogicJar=...
+          Default matches the Ansible-installed location.
+        -->
+        <weblogicJar>/home/john/Oracle/Middleware/Oracle_Home/wlserver/server/lib/weblogic.jar</weblogicJar>
+    </properties>
+
+    <dependencies>
+        <!--
+          WebLogic security SPI — provided at runtime by the WebLogic classloader.
+          System scope keeps it off the shaded JAR.
+        -->
+        <dependency>
+            <groupId>weblogic</groupId>
+            <artifactId>weblogic</artifactId>
+            <version>14.1.2</version>
+            <scope>system</scope>
+            <systemPath>${weblogicJar}</systemPath>
+        </dependency>
+
+        <!--
+          Nimbus JOSE+JWT: RS256 verification + RemoteJWKSet (JWKS fetching with caching).
+          Shaded and relocated into the final JAR to avoid classpath conflicts with any
+          version WebLogic itself may carry.
+        -->
+        <dependency>
+            <groupId>com.nimbusds</groupId>
+            <artifactId>nimbus-jose-jwt</artifactId>
+            <version>9.37.3</version>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <!--
+              Adds the MBeanMaker-generated source directory to the compile roots.
+              build.sh runs MBeanMaker before invoking Maven, writing stubs to
+              target/generated-sources/mdf/.
+            -->
+            <plugin>
+                <groupId>org.codehaus.mojo</groupId>
+                <artifactId>build-helper-maven-plugin</artifactId>
+                <version>3.4.0</version>
+                <executions>
+                    <execution>
+                        <id>add-mdf-sources</id>
+                        <phase>generate-sources</phase>
+                        <goals><goal>add-source</goal></goals>
+                        <configuration>
+                            <sources>
+                                <source>${project.build.directory}/generated-sources/mdf</source>
+                            </sources>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+
+            <!--
+              Shade: bundle nimbus-jose-jwt and its transitive deps (json-smart, etc.)
+              into the final JAR. Relocate to avoid conflicts with anything on the
+              WebLogic system classpath.
+            -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-shade-plugin</artifactId>
+                <version>3.5.2</version>
+                <executions>
+                    <execution>
+                        <phase>package</phase>
+                        <goals><goal>shade</goal></goals>
+                        <configuration>
+                            <shadedArtifactAttached>false</shadedArtifactAttached>
+                            <createDependencyReducedPom>false</createDependencyReducedPom>
+                            <relocations>
+                                <relocation>
+                                    <pattern>com.nimbusds</pattern>
+                                    <shadedPattern>biz.critchley.shaded.nimbusds</shadedPattern>
+                                </relocation>
+                                <relocation>
+                                    <pattern>net.minidev</pattern>
+                                    <shadedPattern>biz.critchley.shaded.minidev</shadedPattern>
+                                </relocation>
+                            </relocations>
+                            <filters>
+                                <filter>
+                                    <artifact>*:*</artifact>
+                                    <excludes>
+                                        <exclude>META-INF/LICENSE*</exclude>
+                                        <exclude>META-INF/NOTICE*</exclude>
+                                        <exclude>META-INF/DEPENDENCIES</exclude>
+                                        <exclude>module-info.class</exclude>
+                                    </excludes>
+                                </filter>
+                            </filters>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+</project>

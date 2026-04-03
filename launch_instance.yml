@@ -1,0 +1,350 @@
+---
+# Launch EC2 instance and configure with Claude Code
+# Usage: ansible-playbook launch_instance.yml -e "name=myhost region=us-east-1"
+#    or: ansible-playbook launch_instance.yml -e "instance_name=myhost region=eu-central-1"
+# Optional: -e "instance_type=t3.medium ami=<region-specific-ami> spot=yes remove_sudo=yes"
+
+- name: Launch EC2 instance and update local hosts
+  hosts: localhost
+  gather_facts: no
+  vars:
+    launch_instance_name: "{{ name | default(instance_name | default('', true), true) }}"
+    launch_region: "{{ region | default('us-east-1', true) }}"
+    launch_instance_type: "{{ instance_type | default('t3.medium', true) }}"
+    default_ami_map:
+      us-east-1: ami-095f312bef9bfe5b1
+      eu-central-1: ami-00ebb2b898eebe380
+    arm_ami_map:
+      eu-central-1: ami-08241d277446b81d7
+    launch_ami: >-
+      {{ ami | default(
+        arm_ami_map.get(launch_region, '')
+        if launch_instance_type.split('.')[0] in ['t4g', 'm7g', 'c7g', 'r8g', 'r8gd', 'c8g', 'm8g']
+        else default_ami_map.get(launch_region, default_ami_map['us-east-1']),
+        true) }}
+    spot_raw: "{{ spot | default('no', true) }}"
+    spot_bool: "{{ spot_raw | lower in ['yes', 'true', '1'] }}"
+    awslaunch_path: /home/john/aws/awslaunch.py
+    aws_open_port_path: /home/john/aws/aws_open_port.py
+    ssh_pubkey_path: /home/john/.ssh/id_ed25519.pub
+    inventory_path: /home/john/ansible/hosts.ini
+
+  tasks:
+    - name: Launch instance via awslaunch.py
+      command: >
+        {{ awslaunch_path }} {{ launch_instance_name }} {{ launch_instance_type }}
+        --region {{ launch_region }}
+        --ami {{ launch_ami }}
+        {{ '--spot' if spot_bool else '' }}
+      register: launch_output
+
+    - name: Debug launch output
+      debug:
+        var: launch_output.stdout_lines
+
+    - name: Extract hosts line
+      set_fact:
+        hosts_line_raw: "{{ launch_output.stdout_lines | select('match', '^Hosts:') | first | regex_replace('^Hosts: ', '') }}"
+
+    - name: Extract public IP
+      set_fact:
+        instance_ip: "{{ hosts_line_raw.split()[0] }}"
+
+    - name: Extract instance ID
+      set_fact:
+        instance_id: "{{ hosts_line_raw.split()[3] }}"
+
+    - name: Build hosts line with weblogicserver alias
+      # Format: IP shortname shortname.critchley.biz weblogicserver instance-id
+      set_fact:
+        hosts_line: "{{ hosts_line_raw.split()[:-1] | join(' ') }} weblogicserver {{ hosts_line_raw.split()[-1] }}"
+
+    - name: Remove old hosts entry for this host if exists
+      lineinfile:
+        path: /etc/hosts
+        regexp: '^[0-9.]+\s+{{ launch_instance_name }}\s'
+        state: absent
+      become: yes
+
+    - name: Remove weblogicserver alias from any previous entry
+      shell: sudo sed -i 's/ weblogicserver//' /etc/hosts
+      changed_when: false
+
+    - name: Check if exact hosts line already present
+      shell: grep -qF "{{ hosts_line }}" /etc/hosts
+      register: hosts_check
+      failed_when: false
+      changed_when: false
+
+    - name: Add hosts entry to /etc/hosts
+      shell: echo "{{ hosts_line }}" | sudo dd of=/etc/hosts oflag=append conv=notrunc status=none
+      when: hosts_check.rc != 0
+
+    - name: Send UDP reload packet to awsctl daemon
+      shell: echo -n "reload" | nc -u -w1 127.0.0.1 5
+      register: udp_response
+      when: hosts_check.rc != 0
+
+    - name: Verify reload response
+      debug:
+        msg: "awsctl response: {{ udp_response.stdout }}"
+      when: hosts_check.rc != 0
+
+    - name: Check if host already in inventory
+      shell: grep -q "^{{ launch_instance_name }}$" {{ inventory_path }}
+      register: inventory_check
+      failed_when: false
+      changed_when: false
+
+    - name: Add host to inventory under region group
+      lineinfile:
+        path: "{{ inventory_path }}"
+        line: "{{ launch_instance_name }}"
+        insertafter: "^\\[{{ launch_region }}\\]"
+      when: inventory_check.rc != 0
+
+    - name: Open port 22 for spot instance
+      command: >
+        {{ aws_open_port_path }} {{ instance_id }} 22 any --region {{ region }}
+      when: spot_bool
+
+    - name: Add new host to in-memory inventory
+      add_host:
+        name: "{{ launch_instance_name }}"
+        ansible_host: "{{ instance_ip }}"
+        ansible_user: admin
+        ansible_ssh_private_key_file: "/home/john/.ssh/{{ launch_instance_name }}.pem"
+        ansible_ssh_common_args: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+        instance_name: "{{ launch_instance_name }}"
+        groups: new_instance
+
+    - name: Wait for SSH to be available
+      wait_for:
+        host: "{{ instance_ip }}"
+        port: 22
+        delay: 5
+        timeout: 120
+
+    - name: Add host key to local known_hosts
+      known_hosts:
+        name: "{{ instance_ip }}"
+        key: "{{ lookup('pipe', 'ssh-keyscan -t ed25519 ' + instance_ip + ' 2>/dev/null') }}"
+        path: /home/john/.ssh/known_hosts
+        state: present
+
+    - name: Add host key by name to local known_hosts
+      known_hosts:
+        name: "{{ launch_instance_name }}"
+        key: "{{ lookup('pipe', 'ssh-keyscan -t ed25519 ' + instance_ip + ' 2>/dev/null') | regex_replace('^[^ ]+', launch_instance_name) }}"
+        path: /home/john/.ssh/known_hosts
+        state: present
+
+
+- name: Configure the new instance
+  hosts: new_instance
+  gather_facts: yes
+  become: yes
+  vars:
+    ssh_pubkey_path: /home/john/.ssh/id_ed25519.pub
+    ssh_pubkey_epam_path: /home/john/.ssh/id_ed25519_epam.pub
+    remove_sudo_raw: "{{ remove_sudo | default('no') }}"
+    remove_sudo_bool: "{{ remove_sudo_raw | lower in ['yes', 'true', '1'] }}"
+
+  tasks:
+    - name: Read local SSH public key
+      set_fact:
+        ssh_pubkey: "{{ lookup('file', ssh_pubkey_path) }}"
+
+    - name: Read local SSH public key
+      set_fact:
+        ssh_pubkey_epam: "{{ lookup('file', ssh_pubkey_epam_path) }}"
+
+    - name: Get admin user info
+      getent:
+        database: passwd
+        key: admin
+
+    - name: Set admin uid/gid facts
+      set_fact:
+        admin_uid: "{{ getent_passwd['admin'][1] }}"
+        admin_gid: "{{ getent_passwd['admin'][2] }}"
+
+    - name: Set hostname
+      hostname:
+        name: "{{ instance_name }}"
+
+    - name: Set FQDN in /etc/hosts
+      lineinfile:
+        path: /etc/hosts
+        regexp: '^127\.0\.1\.1'
+        line: "127.0.1.1 {{ instance_name }}.critchley.biz {{ instance_name }}"
+        insertafter: '^127\.0\.0\.1'
+
+    - name: Ensure root .ssh directory exists
+      file:
+        path: /root/.ssh
+        state: directory
+        mode: '0700'
+        owner: root
+        group: root
+
+    - name: Add SSH key to root authorized_keys
+      authorized_key:
+        user: root
+        key: "{{ ssh_pubkey }}"
+        state: present
+
+    - name: Enable root SSH login
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?PermitRootLogin'
+        line: 'PermitRootLogin prohibit-password'
+      notify: Restart sshd
+
+    - name: Flush handlers to restart sshd before testing root access
+      meta: flush_handlers
+
+    - name: Test root SSH access
+      delegate_to: localhost
+      become: no
+      command: ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -i /home/john/.ssh/id_ed25519 root@{{ ansible_host }} echo "root access works"
+      register: root_test
+      retries: 3
+      delay: 5
+      until: root_test.rc == 0
+
+    - name: Create john user with same uid/gid as admin
+      user:
+        name: john
+        uid: "{{ admin_uid }}"
+        group: "{{ admin_gid }}"
+        home: /home/john
+        shell: /bin/bash
+        create_home: yes
+        non_unique: yes
+
+    - name: Add SSH key to john authorized_keys
+      authorized_key:
+        user: john
+        key: "{{ ssh_pubkey }}"
+        state: present
+
+    - name: Install locales package
+      apt:
+        name: locales
+        state: present
+        update_cache: yes
+
+    - name: Generate en_GB.UTF-8 locale
+      locale_gen:
+        name: en_GB.UTF-8
+        state: present
+
+    - name: Update apt cache and upgrade packages
+      apt:
+        update_cache: yes
+        upgrade: dist
+
+    - name: Install prerequisites
+      apt:
+        name:
+          - curl
+          - ca-certificates
+          - rsync
+          - python-is-python3
+          - python3-pip
+          - libssl-dev
+        state: present
+
+#    - name: Copy .bashrc to john home
+#      become: no
+#      copy:
+#        src: /home/john/.bashrc
+#        dest: /home/john/.bashrc
+#        owner: john
+#        group: "{{ admin_gid }}"
+#        mode: '0644'
+
+    - name: Rsync weekday/john directory to john home
+      become: no
+      synchronize:
+        # src: /home/john/.bashrcs/
+        # dest: /home/john/.bashrcs/
+        src: /home/john/ansible/weekday/john/
+        dest: /home/john/
+        recursive: yes
+
+#    - name: Ensure pip config directory exists
+#      become: no
+#      file:
+#        path: /home/john/.config/pip
+#        state: directory
+#        mode: '0755'
+
+#    - name: Configure pip for john to use --break-system-packages
+#      become: no
+#      copy:
+#        dest: /home/john/.config/pip/pip.conf
+#        content: |
+#          [global]
+#          break-system-packages = true
+#        mode: '0644'
+
+    - name: Add NodeSource repository
+      shell: curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+      args:
+        creates: /etc/apt/sources.list.d/nodesource.list
+
+    - name: Install Node.js
+      apt:
+        name: nodejs
+        state: present
+        update_cache: yes
+
+#    - name: Create npm global directory for john
+#      file:
+#        path: /home/john/.npm
+#        state: directory
+#        owner: john
+#        group: "{{ admin_gid }}"
+#        mode: '0755'
+
+#    - name: Add npm global bin to john's PATH
+#      lineinfile:
+#        path: /home/john/.bashrc
+#        line: 'export PATH="/home/john/.npm/bin:$PATH"'
+#        create: yes
+#        owner: john
+#        group: "{{ admin_gid }}"
+
+    # npm tasks use become: no - admin and john share UID so we can write to john's home
+#    - name: Configure npm prefix for john
+#      become: no
+#      shell: npm config set prefix '/home/john/.npm'
+#      environment:
+#        HOME: /home/john
+
+#    - name: Install Claude Code CLI for john
+#      become: no
+#      npm:
+#        name: "@anthropic-ai/claude-code"
+#        global: yes
+#      environment:
+#        HOME: /home/john
+#        PATH: "/home/john/.npm/bin:/usr/bin:/bin"
+#        NPM_CONFIG_PREFIX: "/home/john/.npm"
+
+    - name: Remove sudo package
+      apt:
+        name: sudo
+        state: absent
+        purge: yes
+      environment:
+        SUDO_FORCE_REMOVE: "yes"
+      when: remove_sudo_bool
+
+  handlers:
+    - name: Restart sshd
+      service:
+        name: sshd
+        state: restarted

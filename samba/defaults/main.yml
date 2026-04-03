@@ -1,0 +1,13 @@
+---
+ubuntu_samba_packages:
+  - samba
+  - samba-common
+#  - python-glade2
+#  - system-config-samba
+workgroup: CRITCHLEY
+private_share_name: john
+private_share_path: /home/john
+samba_group_name: smbgrp
+samba_users:
+  - name: 'john'
+    smbpasswd: 'jsrc1618'

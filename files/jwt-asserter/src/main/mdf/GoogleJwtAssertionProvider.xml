@@ -1,0 +1,78 @@
+<?xml version="1.0" ?>
+<!DOCTYPE MBeanType SYSTEM "commo.dtd">
+
+<!--
+  MBean Definition File for the Google JWT Identity Asserter.
+  Processed by WebLogicMBeanMaker (weblogic.management.commo.WebLogicMBeanMaker)
+  to generate GoogleJwtAssertionProviderMBean interface + implementation stubs.
+-->
+
+<MBeanType
+    Name          = "GoogleJwtAssertionProvider"
+    DisplayName   = "Google JWT Identity Asserter"
+    Package       = "biz.critchley.weblogic.jwt"
+    Extends       = "weblogic.management.security.authentication.IdentityAsserter"
+    PersistPolicy = "OnUpdate"
+>
+
+    <!-- Required: fully-qualified class name of the AuthenticationProviderV2 impl -->
+    <MBeanAttribute
+        Name         = "ProviderClassName"
+        Type         = "java.lang.String"
+        Writeable    = "false"
+        Preprocessor = "weblogic.management.configuration.LegalHelper.checkClassName(value)"
+        Default      = "&quot;biz.critchley.weblogic.jwt.GoogleJwtAssertionProvider&quot;"
+    />
+
+    <MBeanAttribute
+        Name      = "Description"
+        Type      = "java.lang.String"
+        Writeable = "false"
+        Default   = "&quot;Validates Google-issued RS256 ID tokens via JWKS; maps email to WebLogic principal&quot;"
+    />
+
+    <MBeanAttribute
+        Name      = "Version"
+        Type      = "java.lang.String"
+        Writeable = "false"
+        Default   = "&quot;1.0&quot;"
+    />
+
+    <!-- Token type "Bearer" matches the HTTP Authorization: Bearer scheme -->
+    <MBeanAttribute
+        Name      = "SupportedTypes"
+        Type      = "java.lang.String[]"
+        Writeable = "false"
+        Default   = "new String[]{&quot;Bearer&quot;}"
+    />
+
+    <MBeanAttribute
+        Name    = "ActiveTypes"
+        Type    = "java.lang.String[]"
+        Default = "new String[]{&quot;Bearer&quot;}"
+    />
+
+    <!-- Custom configuration attributes -->
+
+    <MBeanAttribute
+        Name        = "JwksUrl"
+        Type        = "java.lang.String"
+        Default     = "&quot;https://www.googleapis.com/oauth2/v3/certs&quot;"
+        Description = "JWKS endpoint for RS256 signature key retrieval. Google rotates keys; RemoteJWKSet caches and refreshes automatically."
+    />
+
+    <MBeanAttribute
+        Name        = "ExpectedAudience"
+        Type        = "java.lang.String"
+        Default     = "&quot;&quot;"
+        Description = "Expected aud claim (Google OAuth2 client ID). Empty string skips the audience check."
+    />
+
+    <MBeanAttribute
+        Name        = "StripEmailDomain"
+        Type        = "boolean"
+        Default     = "true"
+        Description = "Strip @domain from the email claim to derive the WebLogic username. True maps user@example.com to 'user', matching the LDAP uid attribute."
+    />
+
+</MBeanType>
