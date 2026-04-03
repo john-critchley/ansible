@@ -14,6 +14,7 @@ Tests:
 """
 
 import os
+import json
 import shutil
 import subprocess
 import sys
@@ -31,7 +32,8 @@ from selenium.webdriver.support.ui import WebDriverWait
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-PERL_APP        = os.path.expanduser('~/ansible/weekday/john/weblogic_auth_app.pl')
+# Local runs execute directly from staged_weekday as the source of truth.
+PERL_APP        = os.path.expanduser('~/ansible/staged_weekday/john/weblogic_auth_app.pl')
 CREDS_JSON      = os.path.expanduser(
     '~/Desktop/client_secret_1048362443290-'
     '2b5qj413ojqmhnapn36ih59j0m6bl2b3.apps.googleusercontent.com.json'
@@ -85,11 +87,14 @@ def app_running():
 
 def start_perl_app():
     log(f'Starting Perl app on port {APP_PORT}...')
+    env = os.environ.copy()
+    env['OPS_TEST_ALLOW_ROLE_OVERRIDE'] = '1'
     proc = subprocess.Popen(
         ['perl', PERL_APP, 'daemon', '-l', f'http://*:{APP_PORT}',
          '--', '--creds', os.path.expanduser(CREDS_JSON)],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
+        env=env,
     )
     result = wait_until(lambda: app_running(), timeout=10, interval=0.5)
     if not result:
@@ -154,9 +159,12 @@ def body_text(driver):
         return ''
 
 
-def post_ops_action_http(driver, action):
+def post_ops_action_http(driver, action, extra=None):
     cookie_header = '; '.join(f"{c['name']}={c['value']}" for c in driver.get_cookies())
-    data = urllib.parse.urlencode({'action': action}).encode('utf-8')
+    payload = {'action': action}
+    if extra:
+        payload.update(extra)
+    data = urllib.parse.urlencode(payload).encode('utf-8')
     req = urllib.request.Request(
         'http://localhost:8080/ops/action',
         data=data,
@@ -315,6 +323,15 @@ def step_verify_app_response(driver):
     else:
         log('  INFO: auth mode not visible in body.')
 
+    src = driver.page_source
+    expected_links = ['/ops', '/debug', '/debug/refresh', '/breakglass', '/logout']
+    missing = [href for href in expected_links if f'href="{href}"' not in src]
+    if missing:
+        log(f'  FAIL: home page missing navigation links: {missing}')
+        passed = False
+    else:
+        log('  PASS: home page navigation links present.')
+
     # /debug endpoint — poll until body has content
     driver.get('http://localhost:8080/debug')
     wait_for(driver,
@@ -415,6 +432,47 @@ def step_ops_controls(driver):
     return True
 
 
+def step_ops_deny_override(driver):
+    log('[3d] Operations deny-path check (non-permitted role + override)')
+    try:
+        deny_resp = post_ops_action_http(
+            driver,
+            'rotate_log',
+            {'force_attempt': '1', 'test_role': 'breakglass_audit'}
+        )
+    except Exception as exc:
+        return fail(driver, f'ops deny request failed: {exc}')
+
+    log(f'  /ops/action deny response: {deny_resp}')
+    try:
+        deny_json = json.loads(deny_resp)
+    except Exception:
+        return fail(driver, 'ops deny response was not valid JSON')
+
+    if deny_json.get('allowed') not in (0, False):
+        return fail(driver, 'ops deny-path unexpectedly allowed action')
+    if deny_json.get('reason_code') != 'role_not_permitted':
+        return fail(driver, f"unexpected deny reason_code: {deny_json.get('reason_code')}")
+    if 'override attempt made' not in str(deny_json.get('message', '')):
+        return fail(driver, 'deny response missing override attempt marker')
+
+    trace_id = str(deny_json.get('trace_id', '')).strip()
+    if not trace_id:
+        return fail(driver, 'deny response missing trace_id')
+
+    driver.get('http://localhost:8080/ops?decision=denied')
+    wait_for(driver,
+             lambda d: trace_id in body_text(d),
+             APP_TIMEOUT, 'denied audit trace on ops page')
+    screenshot(driver, 'ops_deny_audit')
+    page = body_text(driver)
+    if trace_id not in page or 'DENIED' not in page:
+        return fail(driver, 'deny audit evidence not visible on /ops page')
+
+    log('  PASS: backend denied override attempt and audit evidence is visible.')
+    return True
+
+
 # ── Test 2 & 3: Break-glass ───────────────────────────────────────────────────
 
 def step_breakglass_correct_creds(driver):
@@ -496,6 +554,7 @@ def main():
         results['jwt'] = ok and step_verify_app_response(driver)
         results['token_refresh'] = results['jwt'] and step_token_refresh(driver)
         results['ops_controls'] = results['token_refresh'] and step_ops_controls(driver)
+        results['ops_deny_override'] = results['ops_controls'] and step_ops_deny_override(driver)
 
         # Tests 2 & 3: break-glass
         results['breakglass_correct'] = step_breakglass_correct_creds(driver)

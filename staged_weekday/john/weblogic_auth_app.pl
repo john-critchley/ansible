@@ -342,7 +342,22 @@ sub route_ops {
     my $c = shift;
 
     my $ops = ops_status($c);
-    my $recent_events = read_recent_ops_audit_events(12);
+    my $decision_filter = lc($c->param('decision') // '');
+    my $source_filter = lc($c->param('source') // '');
+    my $recent_events = read_recent_ops_audit_events(50);
+    if ($decision_filter eq 'executed' || $decision_filter eq 'denied') {
+        $recent_events = [ grep { (($_->{decision} // '') eq $decision_filter) } @$recent_events ];
+    }
+    if ($source_filter ne '') {
+        $recent_events = [ grep { index(lc($_->{source} // ''), $source_filter) >= 0 } @$recent_events ];
+    }
+    if (@$recent_events > 20) {
+        @$recent_events = @$recent_events[0..19];
+    }
+
+    my $filter_state = 'all';
+    $filter_state = $decision_filter if ($decision_filter eq 'executed' || $decision_filter eq 'denied');
+    my $filter_source_text = $source_filter eq '' ? 'all' : $source_filter;
     my $status_color = $ops->{mgmt_ok} ? '#0a7f28' : '#7a7a7a';
     my $status_text = $ops->{mgmt_ok} ? 'Reachable' : 'Unavailable';
     my $action_disabled = $ops->{can_rotate} ? '' : 'disabled';
@@ -371,18 +386,19 @@ sub route_ops {
             my $result = ($ev->{decision} // '') eq 'executed' ? 'EXECUTED' : 'DENIED';
             my $cls = ($ev->{decision} // '') eq 'executed' ? 'ok' : 'bad';
             push @rows, sprintf(
-                '<tr><td>%s</td><td>%s</td><td>%s</td><td class="%s">%s</td><td>%s</td><td>%s</td></tr>',
+                '<tr><td>%s</td><td>%s</td><td>%s</td><td class="%s">%s</td><td>%s</td><td>%s</td><td>%s</td></tr>',
                 html_escape($ev->{timestamp} // ''),
                 html_escape($ev->{trace_id} // ''),
                 html_escape($ev->{role} // ''),
                 $cls,
                 html_escape($result),
                 html_escape($ev->{action} // ''),
+                html_escape($ev->{source} // ''),
                 html_escape($ev->{message} // ''),
             );
         }
         if (@rows) {
-            $events_html = '<table><thead><tr><th>Time</th><th>Trace</th><th>Role</th><th>Decision</th><th>Action</th><th>Message</th></tr></thead><tbody>'
+            $events_html = '<table><thead><tr><th>Time</th><th>Trace</th><th>Role</th><th>Decision</th><th>Action</th><th>Source</th><th>Message</th></tr></thead><tbody>'
                 . join('', @rows)
                 . '</tbody></table>';
         }
@@ -446,6 +462,12 @@ sub route_ops {
 
   <div class="panel muted">
         <h3>Recent Policy Decisions</h3>
+                <p><strong>Filters:</strong> decision=%s, source=%s. Quick links:
+                    <a href="/ops">all</a> |
+                    <a href="/ops?decision=executed">executed</a> |
+                    <a href="/ops?decision=denied">denied</a> |
+                    <a href="/ops?source=role-policy">role-policy</a>
+                </p>
         %s
     </div>
 
@@ -471,6 +493,8 @@ HTML
         $action_disabled,
         html_escape($action_hint),
         html_escape($action_hint),
+        html_escape($filter_state),
+        html_escape($filter_source_text),
         $events_html,
     );
 
@@ -559,6 +583,7 @@ sub route_ops_action {
         trace_id  => ($decision->{trace_id} || ''),
         action    => $action,
         role      => ($ops->{role} || 'unknown'),
+        role_source => ($ops->{role_source} || 'identity'),
         email     => ($ops->{email} || ''),
         decision  => ($decision->{allowed} ? 'executed' : 'denied'),
         reason_code => ($decision->{reason_code} || ''),
@@ -614,6 +639,19 @@ sub ops_status {
     $role = 'platform_admin' if $is_platform_admin;
     $role = 'breakglass_ops' if $is_breakglass_ops;
     $role = 'breakglass_audit' if $is_breakglass_audit;
+    my $role_source = 'identity';
+
+    # Test-only role override used by automated deny-path validation.
+    if (($ENV{OPS_TEST_ALLOW_ROLE_OVERRIDE} // '') eq '1') {
+        my $forced = lc($c->param('test_role') // $c->req->headers->header('X-Ops-Test-Role') // '');
+        if ($forced =~ /^(platform_admin|breakglass_ops|breakglass_audit|viewer)$/) {
+            $is_platform_admin = ($forced eq 'platform_admin') ? 1 : 0;
+            $is_breakglass_ops = ($forced eq 'breakglass_ops') ? 1 : 0;
+            $is_breakglass_audit = ($forced eq 'breakglass_audit') ? 1 : 0;
+            $role = $forced;
+            $role_source = 'test_override';
+        }
+    }
 
     my ($mgmt_ok, $mgmt_reason, $last_rotation) = mgmt_runtime_status();
     my ($debug_enabled, $debug_flags_text, $debug_state) = mgmt_security_debug_status();
@@ -640,6 +678,7 @@ sub ops_status {
     return {
         email => $email,
         role => $role,
+        role_source => $role_source,
         is_platform_admin => $is_platform_admin,
         mgmt_ok => $mgmt_ok,
         mgmt_reason => $mgmt_reason,

@@ -139,6 +139,14 @@
         - create_breakglass_user.py
       tags: [weblogic, jwt-asserter, testapp, breakglass]
 
+    - name: Deploy weblogic_auth_app.pl from staged source
+      copy:
+        src: "/home/john/ansible/staged_weekday/john/weblogic_auth_app.pl"
+        dest: "/home/john/weblogic_auth_app.pl"
+        owner: john
+        mode: '0644'
+      tags: [weblogic]
+
 
     # ── 3. Download large binaries on target ──────────────────────────────────
 
