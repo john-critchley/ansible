@@ -34,7 +34,9 @@
     domain_home:  /home/john/Oracle/Middleware/Oracle_Home/user_projects/domains/base_domain
     install_dir:  /home/john/db-install
     java_home:    ""   # detected after JDK install — see set_fact below
-    wls_admin_user: weblogic
+    wls_admin_user:    weblogic
+    breakglass_user:   breakglass
+    breakglass_pass:   "Br3akGl@ss1"   # override with -e breakglass_pass=<pw>
     wls_gdrive_id:              "1rmgNfzgfQwj2WQZxAHZDtgbWcQaiBK5c"
     jwt_asserter_gdrive_id:     "1IqcIeHMmOTSXqcNFZ9dAKg8kWoTpYuHR"
     jwt_asserter_mjf_gdrive_id: "1zYJWAL9MQ-8cObYJByDyeU3irMNdfjuW"
@@ -132,7 +134,8 @@
         - config_ldap.py
         - config_jwt_asserter.py
         - deploy_testapp.py
-      tags: [weblogic, jwt-asserter, testapp]
+        - create_breakglass_user.py
+      tags: [weblogic, jwt-asserter, testapp, breakglass]
 
 
     # ── 3. Download large binaries on target ──────────────────────────────────
@@ -204,19 +207,19 @@
       register: jdk_path_result
       changed_when: false
       when: jdk_arch_map[ansible_architecture].method == 'deb'
-      tags: [weblogic, jwt-asserter, testapp]
+      tags: [weblogic, jwt-asserter, testapp, breakglass]
 
     - name: Set java_home fact from glob result (x86)
       set_fact:
         java_home: "{{ jdk_path_result.stdout }}"
       when: jdk_arch_map[ansible_architecture].method == 'deb'
-      tags: [weblogic, jwt-asserter, testapp]
+      tags: [weblogic, jwt-asserter, testapp, breakglass]
 
     - name: Set java_home fact (ARM — fixed path)
       set_fact:
         java_home: "{{ jdk_arch_map[ansible_architecture].jvm_path }}"
       when: jdk_arch_map[ansible_architecture].method == 'targz'
-      tags: [weblogic, jwt-asserter, testapp]
+      tags: [weblogic, jwt-asserter, testapp, breakglass]
 
     - name: Set JAVA_HOME system-wide
       lineinfile:
@@ -687,7 +690,21 @@
       timeout: 120
       tags: [weblogic, testapp]
 
-    # ── 14. Open port 7001 in security group for controller IP ───────────────
+    # ── 14. Create break-glass emergency user ────────────────────────────────
+
+    - name: Create break-glass user in DefaultAuthenticator (idempotent via userExists check)
+      shell: >
+        export JAVA_HOME="{{ java_home }}" &&
+        export WLS_ADMIN_PASS="{{ wls_admin_pass }}" &&
+        export BREAKGLASS_USER="{{ breakglass_user }}" &&
+        export BREAKGLASS_PASS="{{ breakglass_pass }}" &&
+        {{ oracle_home }}/oracle_common/common/bin/wlst.sh
+        {{ install_dir }}/create_breakglass_user.py
+      become: no
+      timeout: 120
+      tags: [weblogic, breakglass]
+
+    # ── 15. Open port 7001 in security group for controller IP ───────────────
 
     - name: Store target hostname for delegate_to tasks
       set_fact:
