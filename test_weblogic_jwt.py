@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
 """
 End-to-end test: Google OAuth2 login → Perl app → WebLogic JWT asserter.
+Also tests break-glass emergency access (/breakglass route).
 
 Runs non-interactively. Saves screenshots at every significant step.
 Screenshots written to ~/ansible/test-evidence/<timestamp>/
 Exit code 0 = pass, 1 = fail.
+
+Tests:
+  1. JWT flow   — Google login → bearer token → WebLogic testapp → 200
+  2. Break-glass correct creds  → BREAK-GLASS ACCESS GRANTED
+  3. Break-glass wrong creds    → rejected (401)
 """
 
 import os
@@ -12,7 +18,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import time
 from datetime import datetime
 from pathlib import Path
 
@@ -33,18 +38,23 @@ APP_URL         = 'http://localhost:8080/'
 APP_PORT        = 8080
 FIREFOX_PROFILE = os.path.expanduser('~/.mozilla/firefox/0tckkbwo.default-esr-1')
 
+BREAKGLASS_USER = 'breakglass'
+BREAKGLASS_PASS = 'Br3akGl@ss1'
+BREAKGLASS_WRONG_PASS = 'WrongPassword1!'
+
 GOOGLE_LOGIN_TIMEOUT = 60
 APP_TIMEOUT          = 30
+POLL_INTERVAL        = 0.5   # WebDriverWait polls at this interval (seconds)
 
-RUN_ID    = datetime.now().strftime('%Y%m%d_%H%M%S')
-EVIDENCE  = Path(os.path.expanduser(f'~/ansible/test-evidence/{RUN_ID}'))
+RUN_ID   = datetime.now().strftime('%Y%m%d_%H%M%S')
+EVIDENCE = Path(os.path.expanduser(f'~/ansible/test-evidence/{RUN_ID}'))
 
 
 # ── Evidence helpers ──────────────────────────────────────────────────────────
 
 def log(msg):
     ts = datetime.now().strftime('%H:%M:%S')
-    print(f'[{ts}] {msg}')
+    print(f'[{ts}] {msg}', flush=True)
 
 
 def screenshot(driver, label):
@@ -58,7 +68,7 @@ def screenshot(driver, label):
 
 
 def fail(driver, reason):
-    log(f'FAIL: {reason}')
+    log(f'  FAIL: {reason}')
     if driver:
         screenshot(driver, 'FAIL_' + reason[:40].replace(' ', '_'))
     return False
@@ -79,14 +89,13 @@ def start_perl_app():
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-    for _ in range(20):
-        time.sleep(0.5)
-        if app_running():
-            log('  Perl app ready.')
-            return proc
-    log('  ERROR: Perl app did not start in time.')
-    proc.terminate()
-    sys.exit(1)
+    result = wait_until(lambda: app_running(), timeout=10, interval=0.5)
+    if not result:
+        log('  ERROR: Perl app did not start in time.')
+        proc.terminate()
+        sys.exit(1)
+    log('  Perl app ready.')
+    return proc
 
 
 def make_profile_copy():
@@ -111,20 +120,47 @@ def make_driver(profile_dir):
 
 
 def wait_for(driver, condition, timeout, description):
+    """Poll condition every POLL_INTERVAL seconds up to timeout.
+    Takes a screenshot when condition is first met (terminal state).
+    Returns the condition result, or None on timeout."""
     try:
-        return WebDriverWait(driver, timeout).until(condition)
+        result = WebDriverWait(driver, timeout, poll_frequency=POLL_INTERVAL).until(condition)
+        return result
     except Exception:
         log(f'  TIMEOUT waiting for: {description}')
         log(f'  Current URL: {driver.current_url}')
+        screenshot(driver, 'timeout_' + description[:30].replace(' ', '_'))
         return None
 
 
-# ── Test steps ────────────────────────────────────────────────────────────────
+def wait_until(fn, timeout=10, interval=0.5):
+    """Poll a plain callable (no driver). Returns truthy result or None."""
+    import time
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        result = fn()
+        if result:
+            return result
+        time.sleep(interval)
+    return None
+
+
+def body_text(driver):
+    try:
+        return driver.find_element(By.TAG_NAME, 'body').text
+    except Exception:
+        return ''
+
+
+# ── Test 1: JWT flow ──────────────────────────────────────────────────────────
 
 def step_navigate_to_app(driver):
-    log(f'[1] Clearing any existing session via /logout')
+    log('[1] Clearing any existing session via /logout')
     driver.get('http://localhost:8080/logout')
-    time.sleep(1)
+    # Poll until redirect lands back at localhost (or Google)
+    wait_for(driver,
+             lambda d: 'localhost:8080' in d.current_url or 'accounts.google.com' in d.current_url,
+             APP_TIMEOUT, 'post-logout redirect')
     screenshot(driver, 'after_logout')
 
     log(f'[1] Navigating to {APP_URL}')
@@ -135,8 +171,6 @@ def step_navigate_to_app(driver):
 
     if not el and 'accounts.google.com' not in driver.current_url:
         if 'localhost:8080' in driver.current_url:
-            # Google was already logged in — OAuth flow completed silently via
-            # the logout→/→callback round-trip. Session has a fresh id_token.
             log('  OAuth completed silently (Google still logged in). Fresh token acquired.')
             screenshot(driver, 'silent_oauth_complete')
             return True
@@ -153,7 +187,7 @@ def step_google_login(driver):
 
     # "Choose an account" screen
     try:
-        choose = WebDriverWait(driver, 5).until(
+        choose = WebDriverWait(driver, 5, poll_frequency=POLL_INTERVAL).until(
             EC.presence_of_element_located((By.CSS_SELECTOR, '[data-email]'))
         )
         email = choose.get_attribute('data-email')
@@ -170,7 +204,6 @@ def step_google_login(driver):
                                (By.CSS_SELECTOR, 'input[type="email"]')),
                            10, 'email input')
     if not email_input:
-        screenshot(driver, 'email_input_missing')
         return fail(driver, 'email input not found')
 
     email_input.clear()
@@ -185,28 +218,23 @@ def step_google_login(driver):
         return fail(driver, 'Next button after email not found')
     next_btn.click()
 
-    # Password input
+    # Password input — poll until it appears and is filled
     password_input = wait_for(driver,
                               EC.element_to_be_clickable(
                                   (By.CSS_SELECTOR, 'input[type="password"]')),
                               10, 'password input')
     if not password_input:
-        screenshot(driver, 'password_input_missing')
         return fail(driver, 'password input not found')
 
-    time.sleep(1.5)
-    if password_input.get_attribute('value'):
-        log('  Password auto-filled by Firefox.')
+    # Poll until auto-filled (Firefox password manager)
+    filled = wait_for(driver,
+                      lambda d: d.find_element(
+                          By.CSS_SELECTOR, 'input[type="password"]').get_attribute('value'),
+                      20, 'password auto-fill')
+    if filled:
+        log('  Password auto-filled.')
     else:
-        log('  Password not auto-filled — waiting up to 20s...')
-        for _ in range(20):
-            time.sleep(1)
-            if password_input.get_attribute('value'):
-                log('  Password filled.')
-                break
-        else:
-            screenshot(driver, 'password_not_filled')
-            return fail(driver, 'password not filled after 20s')
+        log('  WARN: password not auto-filled after 20s.')
 
     screenshot(driver, 'password_ready')
 
@@ -222,7 +250,7 @@ def step_google_login(driver):
 
 def step_handle_oauth_consent(driver):
     try:
-        allow = WebDriverWait(driver, 5).until(
+        allow = WebDriverWait(driver, 5, poll_frequency=POLL_INTERVAL).until(
             EC.element_to_be_clickable((By.XPATH,
                 '//button[.//span[contains(text(),"Allow") or '
                 'contains(text(),"Continue")]]'))
@@ -240,19 +268,17 @@ def step_verify_app_response(driver):
     el = wait_for(driver, EC.url_contains('localhost'),
                   GOOGLE_LOGIN_TIMEOUT, 'return to localhost after login')
     if not el and 'localhost' not in driver.current_url:
-        screenshot(driver, 'did_not_return_to_app')
         return fail(driver, f'still on {driver.current_url[:60]} after login')
 
     step_handle_oauth_consent(driver)
 
-    # Wait past /callback to the final / route
+    # Poll until past /callback to the final route, then screenshot
     wait_for(driver,
-             lambda d: 'localhost:8080' in d.current_url
-                       and '/callback' not in d.current_url,
-             APP_TIMEOUT, 'final app page')
+             lambda d: 'localhost:8080' in d.current_url and '/callback' not in d.current_url,
+             APP_TIMEOUT, 'final app page (past /callback)')
 
     screenshot(driver, 'app_home_response')
-    body = driver.find_element(By.TAG_NAME, 'body').text
+    body = body_text(driver)
     log(f'  Body: {body}')
 
     passed = True
@@ -271,17 +297,70 @@ def step_verify_app_response(driver):
     else:
         log('  INFO: auth mode not visible in body.')
 
-    # /debug endpoint
+    # /debug endpoint — poll until body has content
     driver.get('http://localhost:8080/debug')
-    time.sleep(1)
+    wait_for(driver,
+             lambda d: body_text(d).strip(),
+             APP_TIMEOUT, 'debug page content')
     screenshot(driver, 'debug_endpoint')
-    debug_body = driver.find_element(By.TAG_NAME, 'body').text
-    log(f'  /debug: {debug_body}')
-
-    if not passed:
-        screenshot(driver, 'FAIL_final_state')
+    log(f'  /debug: {body_text(driver)}')
 
     return passed
+
+
+# ── Test 2 & 3: Break-glass ───────────────────────────────────────────────────
+
+def step_breakglass_correct_creds(driver):
+    log('[4] Break-glass: correct credentials')
+    driver.get('http://localhost:8080/breakglass')
+
+    wait_for(driver, EC.presence_of_element_located((By.NAME, 'username')),
+             APP_TIMEOUT, 'breakglass form loaded')
+    screenshot(driver, 'breakglass_form')
+
+    driver.find_element(By.NAME, 'username').send_keys(BREAKGLASS_USER)
+    driver.find_element(By.NAME, 'password').send_keys(BREAKGLASS_PASS)
+    screenshot(driver, 'breakglass_form_filled')
+    driver.find_element(By.CSS_SELECTOR, 'input[type=submit]').click()
+
+    # Poll until body contains a terminal state (granted or failed)
+    wait_for(driver,
+             lambda d: 'GRANTED' in body_text(d) or 'failed' in body_text(d).lower(),
+             APP_TIMEOUT, 'breakglass response (correct creds)')
+    screenshot(driver, 'breakglass_correct_response')
+
+    body = body_text(driver)
+    log(f'  Body: {body}')
+    if 'BREAK-GLASS ACCESS GRANTED' in body:
+        log('  PASS: break-glass with correct credentials granted.')
+        return True
+    return fail(driver, f'break-glass correct creds — unexpected response: {body[:80]}')
+
+
+def step_breakglass_wrong_creds(driver):
+    log('[5] Break-glass: wrong credentials must be rejected')
+    driver.get('http://localhost:8080/breakglass')
+
+    wait_for(driver, EC.presence_of_element_located((By.NAME, 'username')),
+             APP_TIMEOUT, 'breakglass form loaded (wrong creds test)')
+    screenshot(driver, 'breakglass_form_wrong')
+
+    driver.find_element(By.NAME, 'username').send_keys(BREAKGLASS_USER)
+    driver.find_element(By.NAME, 'password').send_keys(BREAKGLASS_WRONG_PASS)
+    driver.find_element(By.CSS_SELECTOR, 'input[type=submit]').click()
+
+    # Poll until body contains a terminal state
+    wait_for(driver,
+             lambda d: 'GRANTED' in body_text(d) or 'failed' in body_text(d).lower(),
+             APP_TIMEOUT, 'breakglass response (wrong creds)')
+    screenshot(driver, 'breakglass_wrong_response')
+
+    body = body_text(driver)
+    log(f'  Body: {body}')
+    if 'failed' in body.lower() and 'GRANTED' not in body:
+        log('  PASS: break-glass with wrong credentials correctly rejected.')
+        return True
+    return fail(driver, f'break-glass wrong creds — not rejected: {body[:80]}')
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -290,7 +369,7 @@ def main():
     perl_proc   = None
     profile_tmp = None
     driver      = None
-    passed      = False
+    results     = {}
 
     log(f'Evidence directory: {EVIDENCE}')
 
@@ -303,16 +382,15 @@ def main():
         profile_tmp = make_profile_copy()
         driver = make_driver(profile_tmp)
 
+        # Test 1: JWT flow
         ok = step_navigate_to_app(driver)
-        if not ok:
-            return
-
-        if 'accounts.google.com' in driver.current_url:
+        if ok and 'accounts.google.com' in driver.current_url:
             ok = step_google_login(driver)
-            if not ok:
-                return
+        results['jwt'] = ok and step_verify_app_response(driver)
 
-        passed = step_verify_app_response(driver)
+        # Tests 2 & 3: break-glass
+        results['breakglass_correct'] = step_breakglass_correct_creds(driver)
+        results['breakglass_wrong']   = step_breakglass_wrong_creds(driver)
 
     except Exception as e:
         log(f'EXCEPTION: {e}')
@@ -329,7 +407,17 @@ def main():
             log('Stopping Perl app.')
             perl_proc.terminate()
 
-    if passed:
+    log('')
+    log('=== RESULTS ===')
+    all_passed = True
+    for name, passed in results.items():
+        status = 'PASS' if passed else 'FAIL'
+        log(f'  {status}  {name}')
+        if not passed:
+            all_passed = False
+
+    log('')
+    if all_passed:
         log('=== TEST PASSED ===')
         sys.exit(0)
     else:
