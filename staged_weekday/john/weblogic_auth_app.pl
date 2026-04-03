@@ -345,6 +345,10 @@ sub route_ops {
     my $status_text = $ops->{mgmt_ok} ? 'Reachable' : 'Unavailable';
     my $action_disabled = $ops->{can_rotate} ? '' : 'disabled';
     my $action_hint = $ops->{can_rotate} ? 'Rotate AdminServer log now' : $ops->{rotate_reason};
+    my $debug_action_disabled = $ops->{can_set_debug} ? '' : 'disabled';
+    my $debug_action_name = $ops->{debug_enabled} ? 'security_debug_off' : 'security_debug_on';
+    my $debug_action_label = $ops->{debug_enabled} ? 'Disable Security Debug' : 'Enable Security Debug';
+    my $debug_action_hint = $ops->{can_set_debug} ? 'Toggle debugSecurityAtn/debugSecurityAtz' : $ops->{set_debug_reason};
 
     my $last = $c->session('ops_last_result') || {};
     my $last_line = '';
@@ -383,12 +387,19 @@ sub route_ops {
     <p><strong>Role:</strong> %s</p>
     <p><strong>Mgmt API:</strong> <span style="color:%s">%s</span></p>
     <p><strong>Security debug:</strong> %s</p>
+        <p><strong>Security debug flags:</strong> %s</p>
     <p><strong>Last log rotation time:</strong> %s</p>
     %s
   </div>
 
   <div class="panel">
     <h3>Controls</h3>
+        <form method="POST" action="/ops/action" style="margin-bottom:10px;">
+            <input type="hidden" name="action" value="%s" />
+            <button class="btn" %s title="%s">%s</button>
+        </form>
+        <div class="hint">%s</div>
+
     <form method="POST" action="/ops/action">
       <input type="hidden" name="action" value="rotate_log" />
       <button class="btn" %s title="%s">Rotate AdminServer Log</button>
@@ -414,8 +425,14 @@ HTML
         $status_color,
         $status_text,
         html_escape($ops->{debug_state} // 'unknown'),
+        html_escape($ops->{debug_flags_text} // 'unknown'),
         html_escape($ops->{last_rotation} // 'unknown'),
         $last_line,
+        $debug_action_name,
+        $debug_action_disabled,
+        html_escape($debug_action_hint),
+        html_escape($debug_action_label),
+        html_escape($debug_action_hint),
         $action_disabled,
         html_escape($action_hint),
         html_escape($action_hint),
@@ -454,10 +471,37 @@ sub route_ops_action {
             $decision->{reason_code} = 'ok';
             $decision->{message} = 'Action allowed by backend policy';
         }
+    } elsif ($action eq 'security_debug_on' || $action eq 'security_debug_off') {
+        if (!$ops->{is_platform_admin}) {
+            $decision->{reason_code} = 'not_platform_admin';
+            $decision->{message} = 'Requires Platform Admin identity';
+        } elsif (!$ops->{mgmt_ok}) {
+            $decision->{decision_source} = 'service-availability';
+            $decision->{reason_code} = 'mgmt_unavailable';
+            $decision->{message} = $ops->{mgmt_reason} || 'WebLogic management API unavailable';
+        } elsif (($action eq 'security_debug_on' && $ops->{debug_enabled}) || ($action eq 'security_debug_off' && !$ops->{debug_enabled})) {
+            $decision->{decision_source} = 'state-conflict';
+            $decision->{reason_code} = 'already_in_requested_state';
+            $decision->{message} = 'Security debug already in requested state';
+        } else {
+            $decision->{allowed} = 1;
+            $decision->{decision_source} = 'policy-allow';
+            $decision->{reason_code} = 'ok';
+            $decision->{message} = 'Action allowed by backend policy';
+        }
     }
 
     if ($decision->{allowed}) {
-        my ($ok, $code, $msg) = force_log_rotation($c);
+        my ($ok, $code, $msg);
+        if ($action eq 'rotate_log') {
+            ($ok, $code, $msg) = force_log_rotation($c);
+        } elsif ($action eq 'security_debug_on') {
+            ($ok, $code, $msg) = set_security_debug(1);
+        } elsif ($action eq 'security_debug_off') {
+            ($ok, $code, $msg) = set_security_debug(0);
+        } else {
+            ($ok, $code, $msg) = (0, 400, 'Unknown executable action');
+        }
         $decision->{allowed} = $ok ? 1 : 0;
         $decision->{decision_source} = $ok ? 'execution' : 'execution-error';
         $decision->{reason_code} = $ok ? 'executed' : 'execution_failed';
@@ -486,16 +530,22 @@ sub ops_status {
     my $role = $is_platform_admin ? 'platform_admin' : 'viewer';
 
     my ($mgmt_ok, $mgmt_reason, $last_rotation) = mgmt_runtime_status();
-    my $debug_state = 'unknown';
+    my ($debug_enabled, $debug_flags_text, $debug_state) = mgmt_security_debug_status();
 
     my $can_rotate = 1;
     my $rotate_reason = 'Rotate AdminServer log now';
+    my $can_set_debug = 1;
+    my $set_debug_reason = 'Toggle security debug flags';
     if (!$is_platform_admin) {
         $can_rotate = 0;
         $rotate_reason = 'Requires Platform Admin identity';
+        $can_set_debug = 0;
+        $set_debug_reason = 'Requires Platform Admin identity';
     } elsif (!$mgmt_ok) {
         $can_rotate = 0;
         $rotate_reason = $mgmt_reason || 'WebLogic management unavailable';
+        $can_set_debug = 0;
+        $set_debug_reason = $mgmt_reason || 'WebLogic management unavailable';
     }
 
     return {
@@ -504,11 +554,32 @@ sub ops_status {
         is_platform_admin => $is_platform_admin,
         mgmt_ok => $mgmt_ok,
         mgmt_reason => $mgmt_reason,
+        debug_enabled => $debug_enabled,
+        debug_flags_text => $debug_flags_text,
         debug_state => $debug_state,
         last_rotation => $last_rotation,
         can_rotate => $can_rotate,
         rotate_reason => $rotate_reason,
+        can_set_debug => $can_set_debug,
+        set_debug_reason => $set_debug_reason,
     };
+}
+
+sub mgmt_security_debug_status {
+    my $base = mgmt_base_url();
+    return (0, 'unknown', 'unknown') unless $base;
+
+    my $ua = Mojo::UserAgent->new;
+    my $res = $ua->get("$base/serverConfig/servers/AdminServer/serverDebug" => mgmt_headers())->result;
+    return (0, 'unknown', 'unknown') unless $res->is_success;
+
+    my $j = $res->json || {};
+    my $atn = $j->{debugSecurityAtn} ? 1 : 0;
+    my $atz = $j->{debugSecurityAtz} ? 1 : 0;
+    my $enabled = ($atn || $atz) ? 1 : 0;
+    my $flags = sprintf('debugSecurityAtn=%s, debugSecurityAtz=%s', $atn ? 'ON' : 'OFF', $atz ? 'ON' : 'OFF');
+    my $state = $enabled ? 'ON' : 'OFF';
+    return ($enabled, $flags, $state);
 }
 
 sub mgmt_runtime_status {
@@ -538,6 +609,41 @@ sub force_log_rotation {
     return (0, $res->code || 500, "Log rotation failed: $msg");
 }
 
+sub set_security_debug {
+    my ($enabled) = @_;
+
+    my $base = mgmt_base_url();
+    return (0, 0, 'Missing management base URL') unless $base;
+
+    my $ua = Mojo::UserAgent->new;
+
+    my $start = $ua->post("$base/edit/changeManager/startEdit" => mgmt_headers() => json => {
+        waitTimeInMillis => 0,
+        timeoutInMillis  => 120000,
+        exclusive        => 0,
+    })->result;
+    return (0, $start->code || 500, 'Failed to start edit session') unless $start->is_success;
+
+    my $set = $ua->post("$base/edit/servers/AdminServer/serverDebug" => mgmt_headers() => json => {
+        debugSecurityAtn => $enabled ? 1 : 0,
+        debugSecurityAtz => $enabled ? 1 : 0,
+    })->result;
+    if (!$set->is_success) {
+        my $cancel = $ua->post("$base/edit/changeManager/cancelEdit" => mgmt_headers() => json => {})->result;
+        my $msg = $set->body || $set->message || 'Failed to set debug flags';
+        return (0, $set->code || 500, "Security debug update failed: $msg");
+    }
+
+    my $activate = $ua->post("$base/edit/changeManager/activate" => mgmt_headers() => json => {})->result;
+    if (!$activate->is_success) {
+        my $msg = $activate->body || $activate->message || 'Failed to activate changes';
+        return (0, $activate->code || 500, "Security debug activate failed: $msg");
+    }
+
+    my $state = $enabled ? 'ON' : 'OFF';
+    return (1, $activate->code || 200, "Security debug toggled $state");
+}
+
 sub mgmt_base_url {
     my ($base_url) = $creds->{weblogic_url} =~ m{^(https?://[^/]+)};
     return '' unless $base_url;
@@ -550,6 +656,7 @@ sub mgmt_headers {
     my $auth = 'Basic ' . b64_encode("$basic_user:$basic_pass", '');
     return {
         Authorization => $auth,
+        'X-Requested-By' => 'ops-ui',
         Accept        => 'application/json',
         'Content-Type' => 'application/json',
     };
