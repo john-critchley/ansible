@@ -6,8 +6,12 @@
 #   ansible-playbook deploy_weblogic_ldap.yml -e "target=<hostname> wls_admin_pass=<password>"
 # Password must meet WLS policy: >=8 chars, at least one digit or special char.
 #
-# WLS JAR: Google Drive file ID hardcoded (1rmgNfzgfQwj2WQZxAHZDtgbWcQaiBK5c)
-# Override with -e "wls_gdrive_id=<id>" if the file is re-uploaded.
+# WLS JAR:              Google Drive file ID hardcoded (1rmgNfzgfQwj2WQZxAHZDtgbWcQaiBK5c)
+# JWT asserter JAR:     Google Drive file ID hardcoded (1IqcIeHMmOTSXqcNFZ9dAKg8kWoTpYuHR)
+# JWT asserter MJF JAR: Google Drive file ID hardcoded (1zYJWAL9MQ-8cObYJByDyeU3irMNdfjuW)
+# Override any with -e "wls_gdrive_id=<id>" etc. if files are re-uploaded.
+# If the asserter JARs cannot be downloaded, the playbook falls back to building
+# from source via Maven (slower, but always works).
 #
 # Remote Console access (no extra ports needed):
 #   ssh -L 7001:localhost:7001 -L 7002:localhost:7002 <target>
@@ -31,7 +35,9 @@
     install_dir:  /home/john/db-install
     java_home:    ""   # detected after JDK install — see set_fact below
     wls_admin_user: weblogic
-    wls_gdrive_id:  "1rmgNfzgfQwj2WQZxAHZDtgbWcQaiBK5c"
+    wls_gdrive_id:              "1rmgNfzgfQwj2WQZxAHZDtgbWcQaiBK5c"
+    jwt_asserter_gdrive_id:     "1IqcIeHMmOTSXqcNFZ9dAKg8kWoTpYuHR"
+    jwt_asserter_mjf_gdrive_id: "1zYJWAL9MQ-8cObYJByDyeU3irMNdfjuW"
     ldap_admin_dn:  "cn=admin,dc=critchley,dc=biz"
     ldap_admin_pass: ldappass
     ldap_base:      "dc=critchley,dc=biz"
@@ -455,32 +461,55 @@
     # JAR is copied to mbeantypes/ before domain creation so WebLogic starts
     # with the provider class already visible — only one restart needed later.
 
-    - name: Build Google JWT Identity Asserter JAR
-      command: bash {{ install_dir }}/jwt-asserter/build.sh
-      become: yes
-      become_user: john
-      environment:
-        WLS_HOME: "{{ oracle_home }}/wlserver"
-        JAVA_HOME: "{{ java_home }}"
+    - name: Deploy JWT asserter JARs (pre-built from Drive, or build from source)
       tags: [weblogic, jwt-asserter]
+      block:
+        - name: Download JWT asserter provider JAR from Google Drive
+          command: >
+            gdown "https://drive.google.com/uc?id={{ jwt_asserter_gdrive_id }}"
+            -O {{ oracle_home }}/wlserver/server/lib/mbeantypes/google-jwt-asserter-1.0.jar
+          args:
+            creates: "{{ oracle_home }}/wlserver/server/lib/mbeantypes/google-jwt-asserter-1.0.jar"
+          become: yes
+          become_user: john
 
-    - name: Deploy JWT asserter provider JAR to WebLogic mbeantypes
-      copy:
-        src: "{{ install_dir }}/jwt-asserter/target/google-jwt-asserter-1.0.jar"
-        dest: "{{ oracle_home }}/wlserver/server/lib/mbeantypes/google-jwt-asserter-1.0.jar"
-        owner: john
-        mode: '0644'
-        remote_src: yes
-      tags: [weblogic, jwt-asserter]
+        - name: Download JWT asserter MBean metadata JAR from Google Drive
+          command: >
+            gdown "https://drive.google.com/uc?id={{ jwt_asserter_mjf_gdrive_id }}"
+            -O {{ oracle_home }}/wlserver/server/lib/mbeantypes/google-jwt-asserter-1.0-mjf.jar
+          args:
+            creates: "{{ oracle_home }}/wlserver/server/lib/mbeantypes/google-jwt-asserter-1.0-mjf.jar"
+          become: yes
+          become_user: john
 
-    - name: Deploy JWT asserter MBean metadata JAR to WebLogic mbeantypes
-      copy:
-        src: "{{ install_dir }}/jwt-asserter/target/google-jwt-asserter-1.0-mjf.jar"
-        dest: "{{ oracle_home }}/wlserver/server/lib/mbeantypes/google-jwt-asserter-1.0-mjf.jar"
-        owner: john
-        mode: '0644'
-        remote_src: yes
-      tags: [weblogic, jwt-asserter]
+      rescue:
+        - name: "JWT asserter Drive download failed — falling back to Maven build"
+          debug:
+            msg: "Drive download failed. Building JWT asserter from source (this takes ~60s)."
+
+        - name: Build Google JWT Identity Asserter JAR (fallback)
+          command: bash {{ install_dir }}/jwt-asserter/build.sh
+          become: yes
+          become_user: john
+          environment:
+            WLS_HOME: "{{ oracle_home }}/wlserver"
+            JAVA_HOME: "{{ java_home }}"
+
+        - name: Deploy JWT asserter provider JAR to WebLogic mbeantypes (fallback)
+          copy:
+            src: "{{ install_dir }}/jwt-asserter/target/google-jwt-asserter-1.0.jar"
+            dest: "{{ oracle_home }}/wlserver/server/lib/mbeantypes/google-jwt-asserter-1.0.jar"
+            owner: john
+            mode: '0644'
+            remote_src: yes
+
+        - name: Deploy JWT asserter MBean metadata JAR to WebLogic mbeantypes (fallback)
+          copy:
+            src: "{{ install_dir }}/jwt-asserter/target/google-jwt-asserter-1.0-mjf.jar"
+            dest: "{{ oracle_home }}/wlserver/server/lib/mbeantypes/google-jwt-asserter-1.0-mjf.jar"
+            owner: john
+            mode: '0644'
+            remote_src: yes
 
     # ── 9. Create WebLogic domain (WLST offline) ──────────────────────────────
 
