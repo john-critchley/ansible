@@ -480,12 +480,19 @@ sub route_ops {
     my $filter_source_text = $source_filter eq '' ? 'all' : $source_filter;
     my $status_color = $ops->{mgmt_ok} ? '#0a7f28' : '#7a7a7a';
     my $status_text = $ops->{mgmt_ok} ? 'Reachable' : 'Unavailable';
-    my $action_disabled = $ops->{can_rotate} ? '' : 'disabled';
-    my $action_hint = $ops->{can_rotate} ? 'Rotate AdminServer log now' : $ops->{rotate_reason};
-    my $debug_action_disabled = $ops->{can_set_debug} ? '' : 'disabled';
+
+    my $override_lockout = ($c->param('override_lockout') // '') eq 'yes' ? 1 : 0;
+    my $override_qs = $override_lockout ? '?override_lockout=yes' : '';
+
+    my $can_rotate_ui   = $ops->{can_rotate}   || $override_lockout;
+    my $can_set_debug_ui = $ops->{can_set_debug} || $override_lockout;
+
+    my $action_disabled = $can_rotate_ui ? '' : 'disabled';
+    my $action_hint = $can_rotate_ui ? 'Rotate AdminServer log now' : $ops->{rotate_reason};
+    my $debug_action_disabled = $can_set_debug_ui ? '' : 'disabled';
     my $debug_action_name = $ops->{debug_enabled} ? 'security_debug_off' : 'security_debug_on';
     my $debug_action_label = $ops->{debug_enabled} ? 'Disable Security Debug' : 'Enable Security Debug';
-    my $debug_action_hint = $ops->{can_set_debug} ? 'Toggle debugSecurityAtn/debugSecurityAtz' : $ops->{set_debug_reason};
+    my $debug_action_hint = $can_set_debug_ui ? 'Toggle debugSecurityAtn/debugSecurityAtz' : $ops->{set_debug_reason};
 
     my $last = $c->session('ops_last_result') || {};
     my $last_line = '';
@@ -560,23 +567,21 @@ sub route_ops {
 
   <div class="panel">
     <h3>Controls</h3>
-        <form method="POST" action="/ops/action" style="margin-bottom:10px;">
+        <form method="POST" action="/ops/action%s" style="margin-bottom:10px;">
             <input type="hidden" name="action" value="%s" />
             <button class="btn" %s title="%s">%s</button>
         </form>
         <div class="hint">%s</div>
 
-    <form method="POST" action="/ops/action">
+    <form method="POST" action="/ops/action%s">
       <input type="hidden" name="action" value="rotate_log" />
       <button class="btn" %s title="%s">Rotate AdminServer Log</button>
     </form>
     <div class="hint">%s</div>
 
-    <form method="POST" action="/ops/action" style="margin-top:10px;">
-      <input type="hidden" name="action" value="rotate_log" />
-      <input type="hidden" name="force_attempt" value="1" />
-      <button class="btn-danger">Override UI Lockout (demo)</button>
-    </form>
+    <p style="margin-top:12px;">
+      <a class="btn-danger" style="text-decoration:none;padding:8px 14px;" href="/ops?override_lockout=yes">Override UI Lockout (demo)</a>
+    </p>
     <div class="hint">Backend policy still applies. Override only bypasses UI greyout.</div>
   </div>
 
@@ -605,11 +610,13 @@ HTML
         html_escape($ops->{debug_flags_text} // 'unknown'),
         html_escape($ops->{last_rotation} // 'unknown'),
         $last_line,
+        $override_qs,
         $debug_action_name,
         $debug_action_disabled,
         html_escape($debug_action_hint),
         html_escape($debug_action_label),
         html_escape($debug_action_hint),
+        $override_qs,
         $action_disabled,
         html_escape($action_hint),
         html_escape($action_hint),
@@ -626,6 +633,7 @@ sub route_ops_action {
 
     my $action = $c->param('action') // '';
     my $force_attempt = ($c->param('force_attempt') // '') eq '1' ? 1 : 0;
+    my $override_lockout = ($c->param('override_lockout') // '') eq 'yes' ? 1 : 0;
     my $ops = ops_status($c);
 
     my $decision = {
@@ -724,7 +732,7 @@ sub route_ops_action {
 <html>
 <head>
     <title>Operation Result</title>
-    <meta http-equiv="refresh" content="5;url=/ops" />
+    <meta http-equiv="refresh" content="5;url=/ops%s" />
     <style>
         body { font-family: monospace; max-width: 900px; margin: 30px auto; line-height: 1.35; }
         .panel { border: 1px solid #ccc; border-radius: 6px; padding: 14px; margin-bottom: 14px; }
@@ -746,11 +754,12 @@ sub route_ops_action {
     </div>
     <div class="panel muted">
         <p>Returning to Operations Control in 5 seconds.</p>
-        <p><a href="/ops">Go now</a> | <a href="/logout">Logout</a></p>
+        <p><a href="/ops%s">Go now</a> | <a href="/logout">Logout</a></p>
     </div>
 </body>
 </html>
 HTML
+                ($override_lockout ? '?override_lockout=yes' : ''),
                 html_escape($action || 'unknown'),
                 $result_class,
                 html_escape($result_text),
@@ -759,6 +768,7 @@ HTML
                 html_escape($decision->{message} // ''),
                 html_escape($decision->{trace_id} // ''),
                 html_escape($decision->{timestamp} // ''),
+                ($override_lockout ? '?override_lockout=yes' : ''),
         );
 
         $c->render(format => 'html', text => $html);
