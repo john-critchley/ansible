@@ -29,6 +29,8 @@ post '/breakglass' => \&route_breakglass_auth;
 under '/' => \&check_auth;
 
 get '/'      => \&route_home;
+get '/ops'   => \&route_ops;
+post '/ops/action' => \&route_ops_action;
 get '/debug' => sub {
     my $c = shift;
     my $email = $c->session('email') // '';
@@ -333,6 +335,234 @@ sub route_home {
         "\nWebLogic backend call succeeded (HTTP $status) using $auth_mode auth.\n" .
         "Endpoint: $creds->{weblogic_url}\n"
     );
+}
+
+sub route_ops {
+    my $c = shift;
+
+    my $ops = ops_status($c);
+    my $status_color = $ops->{mgmt_ok} ? '#0a7f28' : '#7a7a7a';
+    my $status_text = $ops->{mgmt_ok} ? 'Reachable' : 'Unavailable';
+    my $action_disabled = $ops->{can_rotate} ? '' : 'disabled';
+    my $action_hint = $ops->{can_rotate} ? 'Rotate AdminServer log now' : $ops->{rotate_reason};
+
+    my $last = $c->session('ops_last_result') || {};
+    my $last_line = '';
+    if (ref($last) eq 'HASH' && $last->{timestamp}) {
+        $last_line = sprintf(
+            '<p><strong>Last action:</strong> %s (%s) at %s</p>',
+            html_escape($last->{result} // 'unknown'),
+            html_escape($last->{message} // ''),
+            html_escape($last->{timestamp} // '')
+        );
+    }
+
+    my $html = sprintf(
+        <<'HTML',
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Operations Control</title>
+  <style>
+    body { font-family: monospace; max-width: 900px; margin: 30px auto; line-height: 1.35; }
+    .panel { border: 1px solid #ccc; border-radius: 6px; padding: 14px; margin-bottom: 14px; }
+    .ok { color: #0a7f28; }
+    .bad { color: #a33; }
+    .muted { color: #666; }
+    .btn { padding: 8px 14px; border: 1px solid #333; background: #f2f2f2; cursor: pointer; }
+    .btn:disabled { background: #ddd; color: #888; border-color: #aaa; cursor: not-allowed; }
+    .btn-danger { padding: 8px 14px; border: 1px solid #900; background: #c62828; color: #fff; cursor: pointer; }
+    .hint { margin-top: 8px; color: #666; }
+  </style>
+</head>
+<body>
+  <h1>WebLogic Operations Control</h1>
+  <div class="panel">
+    <h3>Current State</h3>
+    <p><strong>User:</strong> %s</p>
+    <p><strong>Role:</strong> %s</p>
+    <p><strong>Mgmt API:</strong> <span style="color:%s">%s</span></p>
+    <p><strong>Security debug:</strong> %s</p>
+    <p><strong>Last log rotation time:</strong> %s</p>
+    %s
+  </div>
+
+  <div class="panel">
+    <h3>Controls</h3>
+    <form method="POST" action="/ops/action">
+      <input type="hidden" name="action" value="rotate_log" />
+      <button class="btn" %s title="%s">Rotate AdminServer Log</button>
+    </form>
+    <div class="hint">%s</div>
+
+    <form method="POST" action="/ops/action" style="margin-top:10px;">
+      <input type="hidden" name="action" value="rotate_log" />
+      <input type="hidden" name="force_attempt" value="1" />
+      <button class="btn-danger">Override UI Lockout (demo)</button>
+    </form>
+    <div class="hint">Backend policy still applies. Override only bypasses UI greyout.</div>
+  </div>
+
+  <div class="panel muted">
+    <a href="/">Back to home</a> | <a href="/debug">Debug JSON</a>
+  </div>
+</body>
+</html>
+HTML
+        html_escape($ops->{email} // 'unknown'),
+        html_escape($ops->{role} // 'unknown'),
+        $status_color,
+        $status_text,
+        html_escape($ops->{debug_state} // 'unknown'),
+        html_escape($ops->{last_rotation} // 'unknown'),
+        $last_line,
+        $action_disabled,
+        html_escape($action_hint),
+        html_escape($action_hint),
+    );
+
+    $c->render(format => 'html', text => $html);
+}
+
+sub route_ops_action {
+    my $c = shift;
+
+    my $action = $c->param('action') // '';
+    my $force_attempt = ($c->param('force_attempt') // '') eq '1' ? 1 : 0;
+    my $ops = ops_status($c);
+
+    my $decision = {
+        allowed => 0,
+        decision_source => 'role-policy',
+        reason_code => 'unknown_action',
+        message => 'Unknown action',
+        trace_id => sprintf('%d-%06d', time, int(rand(1_000_000))),
+        timestamp => scalar gmtime() . ' UTC',
+    };
+
+    if ($action eq 'rotate_log') {
+        if (!$ops->{is_platform_admin}) {
+            $decision->{reason_code} = 'not_platform_admin';
+            $decision->{message} = 'Requires Platform Admin identity';
+        } elsif (!$ops->{mgmt_ok}) {
+            $decision->{decision_source} = 'service-availability';
+            $decision->{reason_code} = 'mgmt_unavailable';
+            $decision->{message} = $ops->{mgmt_reason} || 'WebLogic management API unavailable';
+        } else {
+            $decision->{allowed} = 1;
+            $decision->{decision_source} = 'policy-allow';
+            $decision->{reason_code} = 'ok';
+            $decision->{message} = 'Action allowed by backend policy';
+        }
+    }
+
+    if ($decision->{allowed}) {
+        my ($ok, $code, $msg) = force_log_rotation($c);
+        $decision->{allowed} = $ok ? 1 : 0;
+        $decision->{decision_source} = $ok ? 'execution' : 'execution-error';
+        $decision->{reason_code} = $ok ? 'executed' : 'execution_failed';
+        $decision->{message} = $msg;
+        $decision->{http_status} = $code;
+    } elsif ($force_attempt) {
+        $decision->{message} .= ' (override attempt made)';
+    }
+
+    $c->session(ops_last_result => {
+        result => ($decision->{reason_code} || 'unknown'),
+        message => ($decision->{message} || ''),
+        timestamp => ($decision->{timestamp} || ''),
+        trace_id => ($decision->{trace_id} || ''),
+    });
+
+    $c->render(json => $decision);
+}
+
+sub ops_status {
+    my ($c) = @_;
+
+    my $email = $c->session('email') // '';
+    my $platform_admin_email = $ENV{PLATFORM_ADMIN_EMAIL} || 'johnsrcritchley@gmail.com';
+    my $is_platform_admin = ($email ne '' && lc($email) eq lc($platform_admin_email)) ? 1 : 0;
+    my $role = $is_platform_admin ? 'platform_admin' : 'viewer';
+
+    my ($mgmt_ok, $mgmt_reason, $last_rotation) = mgmt_runtime_status();
+    my $debug_state = 'unknown';
+
+    my $can_rotate = 1;
+    my $rotate_reason = 'Rotate AdminServer log now';
+    if (!$is_platform_admin) {
+        $can_rotate = 0;
+        $rotate_reason = 'Requires Platform Admin identity';
+    } elsif (!$mgmt_ok) {
+        $can_rotate = 0;
+        $rotate_reason = $mgmt_reason || 'WebLogic management unavailable';
+    }
+
+    return {
+        email => $email,
+        role => $role,
+        is_platform_admin => $is_platform_admin,
+        mgmt_ok => $mgmt_ok,
+        mgmt_reason => $mgmt_reason,
+        debug_state => $debug_state,
+        last_rotation => $last_rotation,
+        can_rotate => $can_rotate,
+        rotate_reason => $rotate_reason,
+    };
+}
+
+sub mgmt_runtime_status {
+    my $base = mgmt_base_url();
+    return (0, 'Missing management base URL', 'unknown') unless $base;
+
+    my $ua = Mojo::UserAgent->new;
+    my $res = $ua->get("$base/serverRuntime/serverLogRuntime" => mgmt_headers())->result;
+    return (0, 'Management API not reachable with configured credentials', 'unknown') unless $res->is_success;
+
+    my $j = $res->json || {};
+    my $opened = $j->{logFileStreamOpened};
+    my $last_rotation = defined($opened) ? ($opened ? 'stream open (rotation supported)' : 'stream closed') : 'unknown';
+    return (1, '', $last_rotation);
+}
+
+sub force_log_rotation {
+    my ($c) = @_;
+    my $base = mgmt_base_url();
+    return (0, 0, 'Missing management base URL') unless $base;
+
+    my $ua = Mojo::UserAgent->new;
+    my $res = $ua->post("$base/serverRuntime/serverLogRuntime/forceLogRotation" => mgmt_headers() => json => {})->result;
+    return (1, $res->code || 200, 'Log rotation triggered') if $res->is_success;
+
+    my $msg = $res->body || $res->message || 'Unknown error';
+    return (0, $res->code || 500, "Log rotation failed: $msg");
+}
+
+sub mgmt_base_url {
+    my ($base_url) = $creds->{weblogic_url} =~ m{^(https?://[^/]+)};
+    return '' unless $base_url;
+    return $base_url . '/management/weblogic/latest';
+}
+
+sub mgmt_headers {
+    my $basic_user = $creds->{wls_basic_user} || 'weblogic';
+    my $basic_pass = $creds->{wls_basic_pass} || 'W3blog1c';
+    my $auth = 'Basic ' . b64_encode("$basic_user:$basic_pass", '');
+    return {
+        Authorization => $auth,
+        Accept        => 'application/json',
+        'Content-Type' => 'application/json',
+    };
+}
+
+sub html_escape {
+    my ($s) = @_;
+    $s = '' unless defined $s;
+    $s =~ s/&/&amp;/g;
+    $s =~ s/</&lt;/g;
+    $s =~ s/>/&gt;/g;
+    $s =~ s/"/&quot;/g;
+    return $s;
 }
 
 sub update_session_identity {
