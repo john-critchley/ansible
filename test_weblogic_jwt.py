@@ -308,6 +308,28 @@ def step_verify_app_response(driver):
     return passed
 
 
+def step_token_refresh(driver):
+    log('[3b] Token refresh flow check via /debug/refresh')
+    driver.get('http://localhost:8080/debug/refresh')
+
+    wait_for(driver,
+             lambda d: body_text(d).strip(),
+             APP_TIMEOUT, 'debug refresh response')
+    screenshot(driver, 'debug_refresh')
+
+    body = body_text(driver)
+    log(f'  /debug/refresh: {body}')
+
+    if ('"ok" 1' in body or 'ok 1' in body) and ('"reason" "token refreshed"' in body or 'reason "token refreshed"' in body):
+        log('  PASS: token refresh succeeded using refresh_token.')
+        return True
+
+    if '"has_refresh_token" 0' in body or 'has_refresh_token 0' in body or '"reason" "token expired and no refresh_token in session"' in body:
+        return fail(driver, 'token refresh unavailable: no refresh_token in session')
+
+    return fail(driver, 'token refresh endpoint did not report success')
+
+
 # ── Test 2 & 3: Break-glass ───────────────────────────────────────────────────
 
 def step_breakglass_correct_creds(driver):
@@ -387,6 +409,7 @@ def main():
         if ok and 'accounts.google.com' in driver.current_url:
             ok = step_google_login(driver)
         results['jwt'] = ok and step_verify_app_response(driver)
+        results['token_refresh'] = results['jwt'] and step_token_refresh(driver)
 
         # Tests 2 & 3: break-glass
         results['breakglass_correct'] = step_breakglass_correct_creds(driver)

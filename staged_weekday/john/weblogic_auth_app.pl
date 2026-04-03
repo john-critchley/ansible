@@ -34,15 +34,27 @@ get '/debug' => sub {
     my $email = $c->session('email') // '';
     my $name = $c->session('name') // '';
     my $has_token = $c->session('id_token') ? 'yes' : 'no';
+    my $has_refresh_token = $c->session('refresh_token') ? 'yes' : 'no';
     my $token_exp = $c->session('id_token_exp') // '';
     my $groups = $c->session('ldap_groups') || [];
     $c->render(json => {
         email        => $email,
         name         => $name,
         has_id_token => $has_token,
+        has_refresh_token => $has_refresh_token,
         id_token_exp => $token_exp,
         ldap_groups  => $groups,
         weblogic_url => $creds->{weblogic_url},
+    });
+};
+get '/debug/refresh' => sub {
+    my $c = shift;
+    my ($ok, $reason) = ensure_fresh_id_token($c, 1);
+    $c->render(json => {
+        ok     => $ok ? 1 : 0,
+        reason => $reason,
+        has_refresh_token => $c->session('refresh_token') ? 1 : 0,
+        id_token_exp      => ($c->session('id_token_exp') // ''),
     });
 };
 
@@ -161,6 +173,8 @@ sub google_auth_url {
         redirect_uri  => $creds->{redirect_uris}[0],
         response_type => 'code',
         scope         => 'openid email profile',
+        access_type   => 'offline',
+        prompt        => 'consent',
         state         => 'lab',
     );
 
@@ -343,7 +357,7 @@ sub update_session_identity {
 }
 
 sub ensure_fresh_id_token {
-    my ($c) = @_;
+    my ($c, $force_refresh) = @_;
 
     my $id_token = $c->session('id_token');
     return (0, 'missing id_token in session') unless $id_token;
@@ -355,7 +369,7 @@ sub ensure_fresh_id_token {
     my $now = time;
     my $refresh_skew = 120;
 
-    if (defined($exp) && $exp > ($now + $refresh_skew)) {
+    if (!$force_refresh && defined($exp) && $exp > ($now + $refresh_skew)) {
         return (1, 'token still valid');
     }
 
