@@ -35,7 +35,7 @@
     install_dir:  /home/john/db-install
     java_home:    ""   # detected after JDK install — see set_fact below
     wls_admin_user:    weblogic
-    wls_admin_pass:    "{{ wls_admin_pass | default(lookup('file', lookup('env', 'HOME') + '/pl/DB/pw') | trim) }}"
+    _wls_pass_file:    "{{ lookup('file', lookup('env', 'HOME') + '/pl/DB/pw') | trim }}"
     breakglass_user:   breakglass
     breakglass_pass:   "Br3akGl@ss1"   # override with -e breakglass_pass=<pw>
     wls_gdrive_id:              "1rmgNfzgfQwj2WQZxAHZDtgbWcQaiBK5c"
@@ -77,6 +77,11 @@
   tasks:
 
     # ── 0. Prepare ────────────────────────────────────────────────────────────
+
+    - name: Resolve effective WLS admin password
+      set_fact:
+        wls_admin_pass: "{{ wls_admin_pass | default(_wls_pass_file) }}"
+      tags: [always]
 
     - name: Require wls_admin_pass to be set
       fail:
