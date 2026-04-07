@@ -70,7 +70,10 @@ sub load_creds {
     my $session_expiry = 28800;
     my $weblogic_url = $ENV{WEBLOGIC_URL} || '';
     my $wls_basic_user = $ENV{WLS_BASIC_USER} || '';
-    my $wls_basic_pass = $ENV{WLS_BASIC_PASS} || '';
+    my $_pw_file = $ENV{HOME} . '/pl/DB/pw';
+    my $wls_basic_pass = $ENV{WLS_BASIC_PASS} || do {
+        if (open my $fh, '<', $_pw_file) { my $p = <$fh>; chomp $p; $p } else { '' }
+    };
     my $ldap_uri = $ENV{LDAP_URI} || 'ldap://weblogicserver:389';
     my $ldap_bind_dn = $ENV{LDAP_BIND_DN} || 'cn=admin,dc=critchley,dc=biz';
     my $ldap_bind_pass = $ENV{LDAP_BIND_PASS} || 'ldappass';
@@ -547,7 +550,7 @@ sub route_ops {
     .btn:disabled { background: #ddd; color: #888; border-color: #aaa; cursor: not-allowed; }
     .btn-danger { padding: 8px 14px; border: 1px solid #900; background: #c62828; color: #fff; cursor: pointer; }
     .hint { margin-top: 8px; color: #666; }
-        table { width: 100%; border-collapse: collapse; font-size: 12px; }
+        table { width: 100%%; border-collapse: collapse; font-size: 12px; }
         th, td { border: 1px solid #ddd; padding: 6px; text-align: left; vertical-align: top; }
         th { background: #f5f5f5; }
   </style>

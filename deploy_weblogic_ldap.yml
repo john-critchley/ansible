@@ -35,6 +35,7 @@
     install_dir:  /home/john/db-install
     java_home:    ""   # detected after JDK install — see set_fact below
     wls_admin_user:    weblogic
+    wls_admin_pass:    "{{ wls_admin_pass | default(lookup('file', lookup('env', 'HOME') + '/pl/DB/pw') | trim) }}"
     breakglass_user:   breakglass
     breakglass_pass:   "Br3akGl@ss1"   # override with -e breakglass_pass=<pw>
     wls_gdrive_id:              "1rmgNfzgfQwj2WQZxAHZDtgbWcQaiBK5c"
@@ -79,7 +80,7 @@
 
     - name: Require wls_admin_pass to be set
       fail:
-        msg: "Pass the WebLogic admin password: -e 'wls_admin_pass=<password>'"
+        msg: "Pass the WebLogic admin password via -e 'wls_admin_pass=<password>' or save it to ~/pl/DB/pw"
       when:
         - (ansible_run_tags | default(['all'])) | intersect(['all', 'weblogic', 'aws', 'verify']) | length > 0
         - wls_admin_pass is not defined or wls_admin_pass == ''
