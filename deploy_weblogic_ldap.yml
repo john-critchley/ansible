@@ -727,6 +727,9 @@
       delegate_to: localhost
       become: no
       register: controller_ip
+      retries: 3
+      delay: 5
+      until: controller_ip.status == 200
       tags: [aws]
 
     - name: Open port 7001 to controller IP in security group
