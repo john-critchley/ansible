@@ -1,0 +1,209 @@
+---
+# Bootstrap a controller machine to run the Derek deployment playbooks.
+# Run this FROM the controller machine itself (localhost) or from pomelo targeting the controller.
+#
+# What this does:
+#   - Installs Python packages: boto3, ansible, selenium
+#   - Installs Ansible collections: amazon.aws, ansible.posix
+#   - Creates ~/pw with the WebLogic admin password (prompted if not given)
+#   - Copies the SSH public key from pomelo if missing on the controller
+#   - Clones the ansible repo from GitHub (if not already present)
+#   - Copies ~/aws/ deploy scripts from pomelo
+#
+# Usage (run locally on controller):
+#   ansible-playbook setup_controller.yml
+#
+# Usage (run from pomelo targeting noodle):
+#   ansible-playbook setup_controller.yml -e "target=noodle"
+#
+# Pass the WebLogic password:
+#   ansible-playbook setup_controller.yml -e "wls_admin_pass=W3blog1c"
+# Or leave it blank and you will be prompted.
+#
+# Note: SSH private key must be copied manually (security):
+#   scp ~/.ssh/id_ed25519 <controller>:~/.ssh/id_ed25519
+#   ssh <controller> 'chmod 600 ~/.ssh/id_ed25519'
+
+- name: Set up controller machine
+  hosts: "{{ target | default('localhost') }}"
+  gather_facts: yes
+  connection: "{{ 'local' if (target | default('localhost')) == 'localhost' else 'ssh' }}"
+  vars:
+    ansible_repo_url: "git@github.com:johncritchley/ansible.git"
+    ansible_repo_dest: "{{ ansible_env.HOME }}/ansible"
+    aws_scripts:
+      - awslaunch.py
+      - aws_open_port.py
+      - awsdecomhost.py
+    pomelo_home: "/home/john"
+    controller_home: "{{ ansible_env.HOME }}"
+
+  vars_prompt:
+    - name: wls_admin_pass
+      prompt: "WebLogic admin password (leave blank to skip)"
+      private: yes
+      default: ""
+
+  tasks:
+
+    # ── Python packages ────────────────────────────────────────────────────────
+
+    - name: Install Python packages
+      pip:
+        name:
+          - boto3
+          - ansible
+          - selenium
+        extra_args: "--user --break-system-packages"
+        executable: pip3
+
+    # ── Ansible collections ────────────────────────────────────────────────────
+
+    - name: Check amazon.aws collection
+      command: ansible-galaxy collection list amazon.aws
+      register: amazon_aws_check
+      failed_when: false
+      changed_when: false
+
+    - name: Install amazon.aws collection
+      command: ansible-galaxy collection install amazon.aws
+      when: "'amazon.aws' not in amazon_aws_check.stdout"
+
+    - name: Check ansible.posix collection
+      command: ansible-galaxy collection list ansible.posix
+      register: posix_check
+      failed_when: false
+      changed_when: false
+
+    - name: Install ansible.posix collection
+      command: ansible-galaxy collection install ansible.posix
+      when: "'ansible.posix' not in posix_check.stdout"
+
+    # ── WebLogic password ──────────────────────────────────────────────────────
+
+    - name: Create ~/pw with WebLogic admin password
+      copy:
+        content: "{{ wls_admin_pass }}"
+        dest: "{{ controller_home }}/pw"
+        mode: '0600'
+      when: wls_admin_pass != ""
+
+    # ── SSH public key (may be missing on a fresh controller) ─────────────────
+
+    - name: Check for SSH public key
+      stat:
+        path: "{{ controller_home }}/.ssh/id_ed25519.pub"
+      register: pubkey_stat
+
+    - name: Copy SSH public key from pomelo
+      delegate_to: localhost
+      become: no
+      command: >
+        scp {{ pomelo_home }}/.ssh/id_ed25519.pub
+        {{ ansible_host | default('localhost') }}:{{ controller_home }}/.ssh/id_ed25519.pub
+      when:
+        - not pubkey_stat.stat.exists
+        - (target | default('localhost')) != 'localhost'
+
+    - name: Note: SSH private key must be copied manually
+      debug:
+        msg:
+          - "SSH private key is NOT copied by this playbook (security)."
+          - "To enable running playbooks from this controller:"
+          - "  scp ~/.ssh/id_ed25519 {{ ansible_host | default(inventory_hostname) }}:~/.ssh/id_ed25519"
+          - "  ssh {{ ansible_host | default(inventory_hostname) }} 'chmod 600 ~/.ssh/id_ed25519'"
+          - "  ssh {{ ansible_host | default(inventory_hostname) }} 'ssh-add ~/.ssh/id_ed25519'"
+
+    # ── Ansible repo ───────────────────────────────────────────────────────────
+
+    - name: Check if ansible repo already present
+      stat:
+        path: "{{ ansible_repo_dest }}/ansible.cfg"
+      register: repo_stat
+
+    - name: Clone ansible repo
+      git:
+        repo: "{{ ansible_repo_url }}"
+        dest: "{{ ansible_repo_dest }}"
+        accept_hostkey: yes
+      when: not repo_stat.stat.exists
+
+    - name: Rsync ansible repo from pomelo (fallback if no GitHub access)
+      delegate_to: localhost
+      become: no
+      synchronize:
+        src: "{{ pomelo_home }}/ansible/"
+        dest: "{{ controller_home }}/ansible/"
+        recursive: yes
+        rsync_opts:
+          - "--exclude=.git"
+          - "--exclude=weekday/"
+          - "--exclude=ansible-roles/"
+          - "--exclude=gdrive-artifacts/"
+          - "--exclude=test-evidence/"
+          - "--exclude=test_weblogic_jwt.py"
+          - "--exclude=*.pyc"
+          - "--exclude=__pycache__"
+      when:
+        - not repo_stat.stat.exists
+        - (target | default('localhost')) != 'localhost'
+      tags: [rsync]
+
+    # ── AWS deploy scripts ─────────────────────────────────────────────────────
+
+    - name: Ensure ~/aws directory exists
+      file:
+        path: "{{ controller_home }}/aws"
+        state: directory
+        mode: '0755'
+
+    - name: Check which aws scripts are present
+      stat:
+        path: "{{ controller_home }}/aws/{{ item }}"
+      register: aws_script_stats
+      loop: "{{ aws_scripts }}"
+
+    - name: Copy missing aws scripts from pomelo
+      delegate_to: localhost
+      become: no
+      command: >
+        scp {{ pomelo_home }}/aws/{{ item.item }}
+        {{ ansible_host | default('localhost') }}:{{ controller_home }}/aws/{{ item.item }}
+      loop: "{{ aws_script_stats.results }}"
+      when:
+        - not item.stat.exists
+        - (target | default('localhost')) != 'localhost'
+
+    - name: Note: copy aws scripts manually if running locally
+      debug:
+        msg: "Copy aws scripts from pomelo: scp ~/aws/awslaunch.py ~/aws/aws_open_port.py ~/aws/awsdecomhost.py <controller>:~/aws/"
+      when:
+        - aws_script_stats.results | selectattr('stat.exists', 'equalto', false) | list | length > 0
+        - (target | default('localhost')) == 'localhost'
+
+    # ── AWS credentials ────────────────────────────────────────────────────────
+
+    - name: Check for AWS credentials
+      stat:
+        path: "{{ controller_home }}/.aws/credentials"
+      register: aws_creds_stat
+
+    - name: Note: AWS credentials must be copied manually
+      debug:
+        msg:
+          - "~/.aws/credentials not found."
+          - "Copy from pomelo: scp -r ~/.aws {{ ansible_host | default(inventory_hostname) }}:~/"
+      when: not aws_creds_stat.stat.exists
+
+    # ── Summary ────────────────────────────────────────────────────────────────
+
+    - name: Controller setup complete
+      debug:
+        msg:
+          - "Controller setup done. Remaining manual steps:"
+          - "1. Copy SSH private key (see note above)"
+          - "2. Copy ~/.aws if missing (see note above)"
+          - "3. Run: ssh-add ~/.ssh/id_ed25519  (before running launch_instance.yml)"
+          - "Deployment sequence:"
+          - "  ansible-playbook ~/ansible/launch_instance.yml -e 'name=<fungus> region=eu-central-1 instance_type=t4g.medium'"
+          - "  ansible-playbook ~/ansible/deploy_weblogic_ldap.yml -e 'target=<fungus>'"

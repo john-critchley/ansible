@@ -4,15 +4,16 @@
 # Creates a Development mode domain with:
 #   - AdminServer on HTTP 7001, SSL 7002 (demo cert, dev mode)
 #   - Admin user: weblogic (password passed via WLS_ADMIN_PASS env var)
-#   - Domain path: /home/john/Oracle/Middleware/Oracle_Home/user_projects/domains/base_domain
+#   - Oracle Home: from WLS_ORACLE_HOME env var (set by Ansible per wls_version)
+#   - Domain path: from WLS_DOMAIN_HOME env var
 #
 # Note: admin user is 'weblogic' (WLS template default), not 'john'.
 # The 'john' name comes from LDAP after config_ldap.py runs.
 
 import os
 
-oracle_home = '/home/john/Oracle/Middleware/Oracle_Home'
-domain_home = oracle_home + '/user_projects/domains/base_domain'
+oracle_home = os.environ.get('WLS_ORACLE_HOME', '/home/john/Oracle/Middleware/Oracle_Home')
+domain_home = os.environ.get('WLS_DOMAIN_HOME', oracle_home + '/user_projects/domains/base_domain')
 template    = oracle_home + '/wlserver/common/templates/wls/wls.jar'
 
 admin_pass = os.environ.get('WLS_ADMIN_PASS')

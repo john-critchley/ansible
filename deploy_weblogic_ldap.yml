@@ -1,15 +1,19 @@
 ---
-# Deploy WebLogic 14.1.2 + OpenLDAP + LDAP authentication
+# Deploy WebLogic + OpenLDAP + LDAP authentication
 # Based on the Derek/DB proof of concept lab
 #
 # Usage:
 #   ansible-playbook deploy_weblogic_ldap.yml -e "target=<hostname> wls_admin_pass=<password>"
+#   ansible-playbook deploy_weblogic_ldap.yml -e "target=<hostname> wls_admin_pass=<password> wls_version=12.2.1.4"
 # Password must meet WLS policy: >=8 chars, at least one digit or special char.
 #
-# WLS JAR:              Google Drive file ID hardcoded (1rmgNfzgfQwj2WQZxAHZDtgbWcQaiBK5c)
+# wls_version selects the WebLogic version to deploy (default: 14.1.2.0):
+#   12.2.1.4  — WLS 12.2.1.4, JDK 11 (OpenJDK), x86_64 only
+#   14.1.1.0  — WLS 14.1.1.0, JDK 11 (OpenJDK), x86_64 + aarch64 (Drive ID placeholder)
+#   14.1.2.0  — WLS 14.1.2.0, JDK 21 (Oracle),  x86_64 + aarch64 (default)
+#
 # JWT asserter JAR:     Google Drive file ID hardcoded (1IqcIeHMmOTSXqcNFZ9dAKg8kWoTpYuHR)
 # JWT asserter MJF JAR: Google Drive file ID hardcoded (1zYJWAL9MQ-8cObYJByDyeU3irMNdfjuW)
-# Override any with -e "wls_gdrive_id=<id>" etc. if files are re-uploaded.
 # If the asserter JARs cannot be downloaded, the playbook falls back to building
 # from source via Maven (slower, but always works).
 #
@@ -30,15 +34,49 @@
   become: yes
 
   vars:
-    oracle_home:  /home/john/Oracle/Middleware/Oracle_Home
-    domain_home:  /home/john/Oracle/Middleware/Oracle_Home/user_projects/domains/base_domain
+    # ── WebLogic version selection ────────────────────────────────────────────
+    # Override with -e "wls_version=12.2.1.4" etc.
+    wls_version: "14.1.2.0"
+
+    wls_version_map:
+      "12.2.1.4":
+        jar_zip:          "fmw_12.2.1.4.0_wls_lite_Disk1_1of1.zip"
+        jar_name:         "fmw_12.2.1.4.0_wls_lite_generic.jar"
+        gdrive_id:        "1OKVlK6v3mK9-DcFESTyujvFgag_IuYgE"
+        oracle_home_dir:  "Oracle_Home_12214"
+        jdk_method:       "oracle_drive"
+        jdk_pkg:          "jdk-8u431-linux-x64.tar.gz"
+        jdk_gdrive_id:    "1cOm6zjSvb4etmwmNoJWAj-t8LwWBbSgi"
+        jdk_path:         "/usr/local/java/oracle-jdk8"
+        jwt_asserter:     false
+        arch_limit:       ["x86_64"]
+      "14.1.1.0":
+        jar_zip:          ""
+        jar_name:         "fmw_14.1.1.0_wls.jar"
+        gdrive_id:        "PLACEHOLDER_UPDATE_WHEN_UPLOADED"
+        oracle_home_dir:  "Oracle_Home_14110"
+        jdk_method:       "apt"
+        jdk_pkg:          "openjdk-21-jdk"
+        jdk_path:         "/usr/lib/jvm/java-21-openjdk-amd64"
+        jwt_asserter:     true
+        arch_limit:       []
+      "14.1.2.0":
+        jar_zip:          ""
+        jar_name:         "fmw_14.1.2.0.0_wls.jar"
+        gdrive_id:        "1rmgNfzgfQwj2WQZxAHZDtgbWcQaiBK5c"
+        oracle_home_dir:  "Oracle_Home"
+        jdk_method:       "oracle21"
+        jdk_pkg:          ""
+        jdk_path:         ""
+        jwt_asserter:     true
+        arch_limit:       []
+
     install_dir:  /home/john/db-install
-    java_home:    ""   # detected after JDK install — see set_fact below
+    java_home:    ""   # set via set_fact after JDK install
     wls_admin_user:    weblogic
-    _wls_pass_file:    "{{ lookup('file', lookup('env', 'HOME') + '/pl/DB/pw') | trim }}"
+    _wls_pass_file:    "{{ lookup('file', lookup('env', 'HOME') + '/pw') | trim }}"
     breakglass_user:   breakglass
     breakglass_pass:   "Br3akGl@ss1"   # override with -e breakglass_pass=<pw>
-    wls_gdrive_id:              "1rmgNfzgfQwj2WQZxAHZDtgbWcQaiBK5c"
     jwt_asserter_gdrive_id:     "1IqcIeHMmOTSXqcNFZ9dAKg8kWoTpYuHR"
     jwt_asserter_mjf_gdrive_id: "1zYJWAL9MQ-8cObYJByDyeU3irMNdfjuW"
     ldap_admin_dn:  "cn=admin,dc=critchley,dc=biz"
@@ -46,11 +84,7 @@
     ldap_base:      "dc=critchley,dc=biz"
     controller_ldap_tunnel: "{{ (enable_controller_ldap_tunnel | default(false) | string | lower) in ['1', 'true', 'yes', 'on'] }}"
     controller_ldap_tunnel_port: "{{ ldap_tunnel_local_port | default(1389) }}"
-    # Architecture-specific JDK settings (set from ansible_architecture)
-    # x86_64: Oracle JDK .deb from oracle.com
-    # aarch64: OpenJDK 21 from apt (Oracle don't ship an ARM .deb)
-    # x86_64: Oracle JDK .deb, path detected via glob
-    # aarch64: Oracle JDK .tar.gz (no .deb available), extracted to fixed path
+    # Oracle JDK 21 architecture map (used only when wls_version=14.1.2.0)
     jdk_arch_map:
       x86_64:  { method: deb,   pkg: "jdk-21_linux-x64_bin.deb",        jvm_path: "" }
       aarch64: { method: targz, pkg: "jdk-21_linux-aarch64_bin.tar.gz",  jvm_path: "/usr/local/java/oracle-jdk21" }
@@ -74,6 +108,28 @@
       when: help_requested
       tags: [always]
 
+    - name: Resolve version-specific vars
+      set_fact:
+        _wls:        "{{ wls_version_map[wls_version] }}"
+        oracle_home: "/home/john/Oracle/Middleware/{{ wls_version_map[wls_version].oracle_home_dir }}"
+        domain_home: "/home/john/Oracle/Middleware/{{ wls_version_map[wls_version].oracle_home_dir }}/user_projects/domains/base_domain"
+        wls_gdrive_id: "{{ wls_gdrive_id | default(wls_version_map[wls_version].gdrive_id) }}"
+      tags: [always]
+
+    - name: Fail if wls_version is unknown
+      fail:
+        msg: "Unknown wls_version '{{ wls_version }}'. Valid values: {{ wls_version_map.keys() | list | join(', ') }}"
+      when: wls_version not in wls_version_map
+      tags: [always]
+
+    - name: Fail if architecture not supported for this version
+      fail:
+        msg: "wls_version {{ wls_version }} is only supported on {{ _wls.arch_limit | join(', ') }} (this host is {{ ansible_architecture }})"
+      when:
+        - _wls.arch_limit | length > 0
+        - ansible_architecture not in _wls.arch_limit
+      tags: [always]
+
   tasks:
 
     # ── 0. Prepare ────────────────────────────────────────────────────────────
@@ -85,7 +141,7 @@
 
     - name: Require wls_admin_pass to be set
       fail:
-        msg: "Pass the WebLogic admin password via -e 'wls_admin_pass=<password>' or save it to ~/pl/DB/pw"
+        msg: "Pass the WebLogic admin password via -e 'wls_admin_pass=<password>' or save it to ~/pw"
       when:
         - (ansible_run_tags | default(['all'])) | intersect(['all', 'weblogic', 'aws', 'verify']) | length > 0
         - wls_admin_pass is not defined or wls_admin_pass == ''
@@ -118,6 +174,28 @@
 
     # ── 2. Copy small files from control node ─────────────────────────────────
 
+    - name: Generate oracle_response.txt with correct ORACLE_HOME for this version
+      copy:
+        dest: "{{ install_dir }}/oracle_response.txt"
+        owner: john
+        mode: '0644'
+        content: |
+          [ENGINE]
+          Response File Version=1.0.0.0.0
+          [GENERIC]
+          DECLINE_AUTO_UPDATES=true
+          MOS_USERNAME=
+          MOS_PASSWORD=<SECURE VALUE>
+          AUTO_UPDATES_LOCATION=
+          SOFTWARE_UPDATES_PROXY_SERVER=
+          SOFTWARE_UPDATES_PROXY_PORT=
+          SOFTWARE_UPDATES_PROXY_USER=
+          SOFTWARE_UPDATES_PROXY_PASSWORD=<SECURE VALUE>
+          ORACLE_HOME={{ oracle_home }}
+          FEDERATED_ORACLE_HOMES=
+          INSTALL_TYPE=WebLogic Server
+      tags: [weblogic]
+
     - name: Copy small install files
       copy:
         src: "/home/john/pl/DB/{{ item }}"
@@ -125,7 +203,6 @@
         owner: john
         mode: '0644'
       loop:
-        - oracle_response.txt
         - ldap-users.ldif
         - add-john.ldif
         - testauth1.pl
@@ -156,6 +233,46 @@
 
     # ── 3. Download large binaries on target ──────────────────────────────────
 
+    # OpenJDK via apt (for wls_version 14.1.1.0)
+    - name: Install OpenJDK via apt
+      apt:
+        name: "{{ _wls.jdk_pkg }}"
+        state: present
+        update_cache: yes
+      when: _wls.jdk_method == 'apt'
+      tags: [weblogic]
+
+    # Oracle JDK via Google Drive download (for wls_version 12.2.1.4)
+    - name: Download Oracle JDK tar.gz from Google Drive
+      command: >
+        gdown "https://drive.google.com/uc?id={{ _wls.jdk_gdrive_id }}"
+        -O {{ install_dir }}/{{ _wls.jdk_pkg }}
+      args:
+        creates: "{{ install_dir }}/{{ _wls.jdk_pkg }}"
+      become: yes
+      become_user: john
+      when: _wls.jdk_method == 'oracle_drive'
+      tags: [weblogic]
+
+    - name: Create Oracle JDK install dir
+      file:
+        path: "{{ _wls.jdk_path }}"
+        state: directory
+        mode: '0755'
+      when: _wls.jdk_method == 'oracle_drive'
+      tags: [weblogic]
+
+    - name: Extract Oracle JDK tar.gz
+      unarchive:
+        src: "{{ install_dir }}/{{ _wls.jdk_pkg }}"
+        dest: "{{ _wls.jdk_path }}"
+        remote_src: yes
+        extra_opts: ['--strip-components=1']
+        creates: "{{ _wls.jdk_path }}/bin/java"
+      when: _wls.jdk_method == 'oracle_drive'
+      tags: [weblogic]
+
+    # Oracle JDK 21 via download (for wls_version 14.1.2.0)
     - name: Download Oracle JDK 21 (x86 — .deb)
       get_url:
         url: "https://download.oracle.com/java/21/latest/{{ jdk_arch_map[ansible_architecture].pkg }}"
@@ -166,7 +283,7 @@
       until: jdk_download is succeeded
       retries: 3
       delay: 10
-      when: jdk_arch_map[ansible_architecture].method == 'deb'
+      when: _wls.jdk_method == 'oracle21' and jdk_arch_map[ansible_architecture].method == 'deb'
       tags: [weblogic]
 
     - name: Download Oracle JDK 21 (ARM — .tar.gz)
@@ -179,25 +296,44 @@
       until: jdk_download_arm is succeeded
       retries: 3
       delay: 10
-      when: jdk_arch_map[ansible_architecture].method == 'targz'
+      when: _wls.jdk_method == 'oracle21' and jdk_arch_map[ansible_architecture].method == 'targz'
       tags: [weblogic]
 
-    - name: Download WebLogic JAR from Google Drive
+    - name: Download WebLogic installer from Google Drive
       command: >
         gdown "https://drive.google.com/uc?id={{ wls_gdrive_id }}"
-        -O {{ install_dir }}/fmw_14.1.2.0.0_wls.jar
+        -O {{ install_dir }}/{{ _wls.jar_zip if _wls.jar_zip else _wls.jar_name }}
       args:
-        creates: "{{ install_dir }}/fmw_14.1.2.0.0_wls.jar"
+        creates: "{{ install_dir }}/{{ _wls.jar_zip if _wls.jar_zip else _wls.jar_name }}"
+      become: yes
+      become_user: john
+      tags: [weblogic]
+
+    - name: Install unzip (needed for zip-packaged installers)
+      apt:
+        name: unzip
+        state: present
+      when: _wls.jar_zip != ""
+      tags: [weblogic]
+
+    - name: Unzip WebLogic installer archive (when zip)
+      unarchive:
+        src: "{{ install_dir }}/{{ _wls.jar_zip }}"
+        dest: "{{ install_dir }}/"
+        remote_src: yes
+        creates: "{{ install_dir }}/{{ _wls.jar_name }}"
+      when: _wls.jar_zip != ""
       become: yes
       become_user: john
       tags: [weblogic]
 
     # ── 4. Install Oracle JDK 21 ──────────────────────────────────────────────
 
+    # Oracle JDK 21 install (oracle21 method only)
     - name: Install Oracle JDK 21 via .deb (x86)
       apt:
         deb: "{{ install_dir }}/{{ jdk_arch_map[ansible_architecture].pkg }}"
-      when: jdk_arch_map[ansible_architecture].method == 'deb'
+      when: _wls.jdk_method == 'oracle21' and jdk_arch_map[ansible_architecture].method == 'deb'
       tags: [weblogic]
 
     - name: Create Oracle JDK install dir (ARM)
@@ -205,7 +341,7 @@
         path: "{{ jdk_arch_map[ansible_architecture].jvm_path }}"
         state: directory
         mode: '0755'
-      when: jdk_arch_map[ansible_architecture].method == 'targz'
+      when: _wls.jdk_method == 'oracle21' and jdk_arch_map[ansible_architecture].method == 'targz'
       tags: [weblogic]
 
     - name: Extract Oracle JDK 21 tar.gz (ARM)
@@ -215,26 +351,33 @@
         remote_src: yes
         extra_opts: ['--strip-components=1']
         creates: "{{ jdk_arch_map[ansible_architecture].jvm_path }}/bin/java"
-      when: jdk_arch_map[ansible_architecture].method == 'targz'
+      when: _wls.jdk_method == 'oracle21' and jdk_arch_map[ansible_architecture].method == 'targz'
       tags: [weblogic]
 
-    - name: Set java_home fact (x86 — detect via glob)
+    # Set java_home fact — method depends on JDK type
+    - name: Set java_home fact (OpenJDK via apt or Oracle JDK via Drive)
+      set_fact:
+        java_home: "{{ _wls.jdk_path }}"
+      when: _wls.jdk_method in ['apt', 'oracle_drive']
+      tags: [weblogic, jwt-asserter, testapp, breakglass]
+
+    - name: Set java_home fact (Oracle JDK 21 x86 — detect via glob)
       shell: "ls -d /usr/lib/jvm/jdk-*-oracle-x64 | tail -1"
       register: jdk_path_result
       changed_when: false
-      when: jdk_arch_map[ansible_architecture].method == 'deb'
+      when: _wls.jdk_method == 'oracle21' and jdk_arch_map[ansible_architecture].method == 'deb'
       tags: [weblogic, jwt-asserter, testapp, breakglass]
 
-    - name: Set java_home fact from glob result (x86)
+    - name: Set java_home fact from glob result (Oracle JDK 21 x86)
       set_fact:
         java_home: "{{ jdk_path_result.stdout }}"
-      when: jdk_arch_map[ansible_architecture].method == 'deb'
+      when: _wls.jdk_method == 'oracle21' and jdk_arch_map[ansible_architecture].method == 'deb'
       tags: [weblogic, jwt-asserter, testapp, breakglass]
 
-    - name: Set java_home fact (ARM — fixed path)
+    - name: Set java_home fact (Oracle JDK 21 ARM — fixed path)
       set_fact:
         java_home: "{{ jdk_arch_map[ansible_architecture].jvm_path }}"
-      when: jdk_arch_map[ansible_architecture].method == 'targz'
+      when: _wls.jdk_method == 'oracle21' and jdk_arch_map[ansible_architecture].method == 'targz'
       tags: [weblogic, jwt-asserter, testapp, breakglass]
 
     - name: Set JAVA_HOME system-wide
@@ -451,7 +594,7 @@
       command: >
         {{ java_home }}/bin/java
         -Djava.io.tmpdir=/home/john/tmp
-        -jar {{ install_dir }}/fmw_14.1.2.0.0_wls.jar
+        -jar {{ install_dir }}/{{ _wls.jar_name }}
         -silent -responseFile {{ install_dir }}/oracle_response.txt
       args:
         creates: "{{ oracle_home }}/wlserver"
@@ -468,8 +611,19 @@
     # JAR is copied to mbeantypes/ before domain creation so WebLogic starts
     # with the provider class already visible — only one restart needed later.
 
+    - name: Remove JWT asserter JARs (incompatible with this WLS version)
+      file:
+        path: "{{ oracle_home }}/wlserver/server/lib/mbeantypes/{{ item }}"
+        state: absent
+      loop:
+        - google-jwt-asserter-1.0.jar
+        - google-jwt-asserter-1.0-mjf.jar
+      when: not (_wls.jwt_asserter | bool)
+      tags: [weblogic, jwt-asserter]
+
     - name: Deploy JWT asserter JARs (pre-built from Drive, or build from source)
       tags: [weblogic, jwt-asserter]
+      when: _wls.jwt_asserter | bool
       block:
         - name: Download JWT asserter provider JAR from Google Drive
           command: >
@@ -544,6 +698,8 @@
         JAVA_HOME: "{{ java_home }}"
         _JAVA_OPTIONS: "-Djava.awt.headless=true"
         WLS_ADMIN_PASS: "{{ wls_admin_pass }}"
+        WLS_ORACLE_HOME: "{{ oracle_home }}"
+        WLS_DOMAIN_HOME: "{{ domain_home }}"
       timeout: 300
       tags: [weblogic]
 
@@ -626,6 +782,7 @@
       register: jwt_asserter_check
       failed_when: false
       changed_when: false
+      when: _wls.jwt_asserter | bool
       tags: [weblogic, jwt-asserter]
 
     - name: Configure JWT asserter via WLST
@@ -639,7 +796,7 @@
         _JAVA_OPTIONS: "-Djava.awt.headless=true"
         WLS_ADMIN_PASS: "{{ wls_admin_pass }}"
         JWT_AUDIENCE: "1048362443290-2b5qj413ojqmhnapn36ih59j0m6bl2b3.apps.googleusercontent.com"
-      when: jwt_asserter_check.rc != 0
+      when: (_wls.jwt_asserter | bool) and jwt_asserter_check.rc != 0
       timeout: 120
       tags: [weblogic, jwt-asserter]
 
@@ -649,7 +806,7 @@
       systemd:
         name: weblogic
         state: restarted
-      when: (ldapauth_check is defined and ldapauth_check.rc != 0) or jwt_asserter_check.rc != 0
+      when: (ldapauth_check is defined and ldapauth_check.rc != 0) or ((_wls.jwt_asserter | bool) and jwt_asserter_check is defined and jwt_asserter_check.rc != 0)
       tags: [weblogic, jwt-asserter]
 
     - name: Start WebLogic via systemd (if not already running)

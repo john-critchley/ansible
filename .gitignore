@@ -17,6 +17,9 @@ ansible-roles/
 # Pre-built artifacts for Google Drive upload (outputs of build_gdrive_artifacts.sh)
 gdrive-artifacts/
 
+# Not part of the playbook — requires desktop Firefox profile
+test_weblogic_jwt.py
+
 # Ansible retry files
 *.retry
 
