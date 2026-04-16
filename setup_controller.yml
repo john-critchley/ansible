@@ -181,6 +181,30 @@
         - aws_script_stats.results | selectattr('stat.exists', 'equalto', false) | list | length > 0
         - (target | default('localhost')) == 'localhost'
 
+    # ── secrets.yml ───────────────────────────────────────────────────────────
+
+    - name: Check for secrets.yml
+      stat:
+        path: "{{ controller_home }}/ansible/secrets.yml"
+      register: secrets_stat
+
+    - name: Copy secrets.yml from pomelo
+      delegate_to: localhost
+      become: no
+      command: >
+        scp {{ pomelo_home }}/ansible/secrets.yml
+        {{ ansible_host | default('localhost') }}:{{ controller_home }}/ansible/secrets.yml
+      when:
+        - not secrets_stat.stat.exists
+        - (target | default('localhost')) != 'localhost'
+
+    - name: Note: copy secrets.yml manually if running locally
+      debug:
+        msg: "Copy secrets: scp ~/ansible/secrets.yml <controller>:~/ansible/secrets.yml"
+      when:
+        - not secrets_stat.stat.exists
+        - (target | default('localhost')) == 'localhost'
+
     # ── AWS credentials ────────────────────────────────────────────────────────
 
     - name: Check for AWS credentials

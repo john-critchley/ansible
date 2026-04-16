@@ -20,6 +20,9 @@ gdrive-artifacts/
 # Not part of the playbook — requires desktop Firefox profile
 test_weblogic_jwt.py
 
+# Local secrets — copy separately via scp, never commit
+secrets.yml
+
 # Ansible retry files
 *.retry
 
