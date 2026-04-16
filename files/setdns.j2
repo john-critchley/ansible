@@ -1,7 +1,7 @@
 #!/usr/bin/bash
 
-user=jcritchley
-token=6A0EA1BB4342CB8F
+user={{ zoneedit_user }}
+token={{ zoneedit_token }}
 host=`hostname`.critchley.biz
 [ "$1" == start ] &&
 curl -v "https://$user:$token@dynamic.zoneedit.com/auth/dynamic.html?host=$host" >> /var/log/setdns.log 2>&1
