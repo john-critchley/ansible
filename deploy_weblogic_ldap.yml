@@ -104,7 +104,7 @@
           - "Help: ansible-playbook deploy_weblogic_ldap.yml -e 'help=yes'"
           - "LDAP-only run: ansible-playbook deploy_weblogic_ldap.yml -e 'target=<hostname> wls_admin_pass=<password>' --tags ldap-users"
           - "Available tags: ldap-users, ldap, weblogic, aws, verify"
-          - "Notes: ldap-users adds base LDAP entries plus johnsrcritchley and repairs Administrators membership if needed. weblogic covers Java, WebLogic install/domain/service/auth tasks. aws opens port 7001 for the controller IP. verify runs the API checks."
+          - "Notes: ldap-users adds base LDAP entries plus john and repairs Administrators membership if needed. weblogic covers Java, WebLogic install/domain/service/auth tasks. aws opens port 7001 for the controller IP. verify runs the API checks."
       when: help_requested
       tags: [always]
 
@@ -526,7 +526,7 @@
     - name: Check if LDAP john user already exists
       command: >
         ldapsearch -x -H ldap://localhost
-        -b "ou=users,ou=winterbourne,dc=critchley,dc=biz" "(uid=johnsrcritchley)" dn
+        -b "ou=users,ou=winterbourne,dc=critchley,dc=biz" "(uid=john)" dn
       register: ldap_john_check
       changed_when: false
       failed_when: false
@@ -536,14 +536,14 @@
       command: >
         ldapadd -x -D "{{ ldap_admin_dn }}" -w {{ ldap_admin_pass }}
         -f {{ install_dir }}/add-john.ldif
-      when: "'dn: uid=johnsrcritchley,ou=users,ou=winterbourne,dc=critchley,dc=biz' not in ldap_john_check.stdout"
+      when: "'dn: uid=john,ou=users,ou=winterbourne,dc=critchley,dc=biz' not in ldap_john_check.stdout"
       tags: [ldap-users]
 
     - name: Check if john is already in LDAP Administrators group
       command: >
         ldapsearch -x -H ldap://localhost
         -b "ou=groups,ou=winterbourne,dc=critchley,dc=biz"
-        "(member=uid=johnsrcritchley,ou=users,ou=winterbourne,dc=critchley,dc=biz)" dn
+        "(member=uid=john,ou=users,ou=winterbourne,dc=critchley,dc=biz)" dn
       register: ldap_john_group_check
       changed_when: false
       failed_when: false
@@ -555,7 +555,7 @@
         dn: cn=Administrators,ou=groups,ou=winterbourne,dc=critchley,dc=biz
         changetype: modify
         add: member
-        member: uid=johnsrcritchley,ou=users,ou=winterbourne,dc=critchley,dc=biz
+        member: uid=john,ou=users,ou=winterbourne,dc=critchley,dc=biz
         EOF
       when: "'dn: cn=Administrators,ou=groups,ou=winterbourne,dc=critchley,dc=biz' not in ldap_john_group_check.stdout"
       tags: [ldap-users]
