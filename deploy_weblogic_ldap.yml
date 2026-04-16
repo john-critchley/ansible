@@ -154,9 +154,19 @@
       when: breakglass_pass is not defined or breakglass_pass == ''
       tags: [always]
 
+    - name: Save generated breakglass password to ~/breakglass_pw
+      copy:
+        content: "{{ breakglass_pass }}"
+        dest: "{{ lookup('env', 'HOME') }}/breakglass_pw"
+        mode: '0600'
+      delegate_to: localhost
+      become: no
+      when: _bg_pass_gen is not skipped
+      tags: [always]
+
     - name: Show generated breakglass password
       debug:
-        msg: "Generated breakglass password: {{ breakglass_pass }} (save this now — it is not stored)"
+        msg: "Generated breakglass password saved to ~/breakglass_pw"
       when: _bg_pass_gen is not skipped
       tags: [always]
 

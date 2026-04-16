@@ -704,7 +704,7 @@ sub ops_status {
     my $auth_source = $c->session('auth_source') // 'oauth';
     my $session_breakglass_role = $c->session('breakglass_role') // '';
     my $groups = $c->session('ldap_groups') || [];
-    my $platform_admin_email = $ENV{PLATFORM_ADMIN_EMAIL} || 'johnsrcritchley@gmail.com';
+    my $platform_admin_email = $ENV{PLATFORM_ADMIN_EMAIL} || '';
     my $breakglass_ops_email = $ENV{BREAKGLASS_OPS_EMAIL} || '';
     my $breakglass_audit_email = $ENV{BREAKGLASS_AUDIT_EMAIL} || '';
 
