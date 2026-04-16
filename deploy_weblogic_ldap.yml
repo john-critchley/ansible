@@ -76,7 +76,12 @@
     wls_admin_user:    weblogic
     _wls_pass_file:    "{{ lookup('file', lookup('env', 'HOME') + '/pw') | trim }}"
     breakglass_user:   breakglass
-    breakglass_pass:   "Br3akGl@ss1"   # override with -e breakglass_pass=<pw>
+    # breakglass_pass is generated fresh each deploy (see pre_tasks).
+    # Override with -e breakglass_pass=<pw> to set a specific value.
+    # jwt_audience: Google OAuth2 client ID (ends in .apps.googleusercontent.com)
+    # Pass via -e "jwt_audience=<id>" or set in group_vars. Left blank here — the
+    # JWT asserter will accept any audience when blank, which is fine for a dev lab.
+    jwt_audience:      ""
     jwt_asserter_gdrive_id:     "1IqcIeHMmOTSXqcNFZ9dAKg8kWoTpYuHR"
     jwt_asserter_mjf_gdrive_id: "1zYJWAL9MQ-8cObYJByDyeU3irMNdfjuW"
     ldap_admin_dn:  "cn=admin,dc=critchley,dc=biz"
@@ -133,6 +138,27 @@
   tasks:
 
     # ── 0. Prepare ────────────────────────────────────────────────────────────
+
+    - name: Generate breakglass password if not provided
+      command: bash -c "dd if=/dev/random count=1 bs=32 status=none | tr -cd '[ -~]'"
+      register: _bg_pass_gen
+      changed_when: false
+      when: breakglass_pass is not defined or breakglass_pass == ''
+      delegate_to: localhost
+      become: no
+      tags: [always]
+
+    - name: Set breakglass_pass fact
+      set_fact:
+        breakglass_pass: "{{ _bg_pass_gen.stdout }}"
+      when: breakglass_pass is not defined or breakglass_pass == ''
+      tags: [always]
+
+    - name: Show generated breakglass password
+      debug:
+        msg: "Generated breakglass password: {{ breakglass_pass }} (save this now — it is not stored)"
+      when: _bg_pass_gen is not skipped
+      tags: [always]
 
     - name: Resolve effective WLS admin password
       set_fact:
@@ -795,7 +821,7 @@
         JAVA_HOME: "{{ java_home }}"
         _JAVA_OPTIONS: "-Djava.awt.headless=true"
         WLS_ADMIN_PASS: "{{ wls_admin_pass }}"
-        JWT_AUDIENCE: "1048362443290-2b5qj413ojqmhnapn36ih59j0m6bl2b3.apps.googleusercontent.com"
+        JWT_AUDIENCE: "{{ jwt_audience | default('') }}"
       when: (_wls.jwt_asserter | bool) and jwt_asserter_check.rc != 0
       timeout: 120
       tags: [weblogic, jwt-asserter]
