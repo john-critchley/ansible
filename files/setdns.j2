@@ -1,7 +1,21 @@
 #!/usr/bin/bash
+exec >> /var/log/setdns.log 2>&1
+echo "setdns called: $(date) args: $*"
 
-user={{ zoneedit_user }}
-token={{ zoneedit_token }}
-host=`hostname`.critchley.biz
-[ "$1" == start ] &&
-curl -v "https://$user:$token@dynamic.zoneedit.com/auth/dynamic.html?host=$host" >> /var/log/setdns.log 2>&1
+user=$(yq '.zoneedit_user' /etc/secrets.yml | tr -d '"')
+token=$(yq '.zoneedit_token' /etc/secrets.yml | tr -d '"')
+host=$(hostname).critchley.biz
+
+{ [ "$1" == start ] || [ $# -eq 0 ]; } || exit 0
+
+# Check if A record already matches our current IP
+current_ip=$(curl -sf https://checkip.amazonaws.com || curl -sf https://api.ipify.org)
+dns_ip=$(dig +short "$host" A | tail -1)
+
+if [ "$current_ip" = "$dns_ip" ]; then
+    echo "DNS already correct ($host -> $current_ip), skipping update"
+    exit 0
+fi
+
+echo "Updating DNS: $host -> $current_ip (was: ${dns_ip:-unset})"
+curl -v "https://$user:$token@dynamic.zoneedit.com/auth/dynamic.html?host=$host"

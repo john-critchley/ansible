@@ -343,6 +343,85 @@
         SUDO_FORCE_REMOVE: "yes"
       when: remove_sudo_bool
 
+    # ── rc.local / rcs startup framework ──────────────────────────────────────
+
+    - name: Install yq (needed by setdns)
+      apt:
+        name: python3-yq
+        state: present
+
+    - name: Read ZoneEdit secrets from controller
+      set_fact:
+        zoneedit_user: "{{ lookup('file', lookup('env', 'HOME') + '/ansible/secrets.yml') | from_yaml | json_query('zoneedit_user') }}"
+        zoneedit_token: "{{ lookup('file', lookup('env', 'HOME') + '/ansible/secrets.yml') | from_yaml | json_query('zoneedit_token') }}"
+      delegate_to: localhost
+      become: no
+
+    - name: Deploy /etc/secrets.yml
+      copy:
+        dest: /etc/secrets.yml
+        mode: '0640'
+        owner: root
+        group: root
+        content: |
+          zoneedit_user: "{{ zoneedit_user }}"
+          zoneedit_token: "{{ zoneedit_token }}"
+
+    - name: Create /etc/rcs directory
+      file:
+        path: /etc/rcs
+        state: directory
+        mode: '0755'
+        owner: root
+        group: root
+
+    - name: Deploy /etc/rcs/setdns
+      template:
+        src: files/setdns.j2
+        dest: /etc/rcs/setdns
+        mode: '0755'
+        owner: root
+        group: root
+
+    - name: Deploy /etc/rc.local
+      copy:
+        src: files/rc.local
+        dest: /etc/rc.local
+        mode: '0755'
+        owner: root
+        group: root
+
+    - name: Deploy rc-local systemd unit
+      copy:
+        dest: /etc/systemd/system/rc-local.service
+        mode: '0644'
+        owner: root
+        group: root
+        content: |
+          [Unit]
+          Description=rc.local compatibility
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          Type=oneshot
+          ExecStart=/etc/rc.local start
+          RemainAfterExit=yes
+          StandardOutput=journal
+          StandardError=journal
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Enable rc-local service
+      systemd:
+        name: rc-local
+        enabled: yes
+        daemon_reload: yes
+
+    - name: Run rc.local start now
+      command: /etc/rc.local start
+
   handlers:
     - name: Restart sshd
       service:
