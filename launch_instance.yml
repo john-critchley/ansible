@@ -16,6 +16,7 @@
       eu-central-1: ami-00ebb2b898eebe380
     arm_ami_map:
       eu-central-1: ami-08241d277446b81d7
+      eu-north-1: ami-0fd7923e0af278466
     launch_ami: >-
       {{ ami | default(
         arm_ami_map.get(launch_region, '')
@@ -344,11 +345,6 @@
       when: remove_sudo_bool
 
     # ── rc.local / rcs startup framework ──────────────────────────────────────
-
-    - name: Install yq (needed by setdns)
-      apt:
-        name: python3-yq
-        state: present
 
     - name: Read ZoneEdit secrets from controller
       set_fact:

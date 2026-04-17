@@ -2,15 +2,15 @@
 exec >> /var/log/setdns.log 2>&1
 echo "setdns called: $(date) args: $*"
 
-user=$(yq '.zoneedit_user' /etc/secrets.yml | tr -d '"')
-token=$(yq '.zoneedit_token' /etc/secrets.yml | tr -d '"')
+user=$(python3 -c "import yaml; print(yaml.safe_load(open('/etc/secrets.yml'))['zoneedit_user'])")
+token=$(python3 -c "import yaml; print(yaml.safe_load(open('/etc/secrets.yml'))['zoneedit_token'])")
 host=$(hostname).critchley.biz
 
 { [ "$1" == start ] || [ $# -eq 0 ]; } || exit 0
 
 # Check if A record already matches our current IP
 current_ip=$(curl -sf https://checkip.amazonaws.com || curl -sf https://api.ipify.org)
-dns_ip=$(dig +short "$host" A | tail -1)
+dns_ip=$(host -t A "$host" 2>/dev/null | awk '/has address/{print $NF}' | tail -1)
 
 if [ "$current_ip" = "$dns_ip" ]; then
     echo "DNS already correct ($host -> $current_ip), skipping update"
