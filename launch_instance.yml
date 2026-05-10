@@ -2,7 +2,7 @@
 # Launch EC2 instance and configure with Claude Code
 # Usage: ansible-playbook launch_instance.yml -e "name=myhost region=us-east-1"
 #    or: ansible-playbook launch_instance.yml -e "instance_name=myhost region=eu-central-1"
-# Optional: -e "instance_type=t3.medium ami=<region-specific-ami> spot=yes remove_sudo=yes"
+# Optional: -e "instance_type=t3.medium ami=<region-specific-ami> spot=yes remove_sudo=yes aliases='weblogicserver foo'"
 
 - name: Launch EC2 instance and update local hosts
   hosts: localhost
@@ -17,6 +17,7 @@
     arm_ami_map:
       eu-central-1: ami-08241d277446b81d7
       eu-north-1: ami-0fd7923e0af278466
+    extra_aliases: "{{ aliases | default('', true) }}"
     launch_ami: >-
       {{ ami | default(
         arm_ami_map.get(launch_region, '')
@@ -55,10 +56,10 @@
       set_fact:
         instance_id: "{{ hosts_line_raw.split()[3] }}"
 
-    - name: Build hosts line with weblogicserver alias
-      # Format: IP shortname shortname.critchley.biz weblogicserver instance-id
+    - name: Build hosts line
+      # Format: IP shortname shortname.critchley.biz [aliases] instance-id
       set_fact:
-        hosts_line: "{{ hosts_line_raw.split()[:-1] | join(' ') }} weblogicserver {{ hosts_line_raw.split()[-1] }}"
+        hosts_line: "{{ hosts_line_raw.split()[:-1] | join(' ') }}{{ ' ' + extra_aliases if extra_aliases else '' }} {{ hosts_line_raw.split()[-1] }}"
 
     - name: Remove old hosts entry for this host if exists
       lineinfile:
@@ -66,10 +67,6 @@
         regexp: '^[0-9.]+\s+{{ launch_instance_name }}\s'
         state: absent
       become: yes
-
-    - name: Remove weblogicserver alias from any previous entry
-      shell: sudo sed -i 's/ weblogicserver//' /etc/hosts
-      changed_when: false
 
     - name: Check if exact hosts line already present
       shell: grep -qF "{{ hosts_line }}" /etc/hosts
@@ -109,6 +106,15 @@
         {{ aws_open_port_path }} {{ instance_id }} 22 any --region {{ region }}
       when: spot_bool
 
+    - name: Update hosts note
+      command: >
+        /home/john/aws/update_hosts_note.py provision
+        {{ launch_instance_name }} {{ instance_id }} {{ launch_region }} {{ instance_ip }}
+        --type {{ 'spot' if spot_bool else 'permanent' }}
+        {{ '--project ' + project if project is defined else '' }}
+      delegate_to: localhost
+      become: no
+
     - name: Add new host to in-memory inventory
       add_host:
         name: "{{ launch_instance_name }}"
@@ -142,7 +148,7 @@
 
 
 - name: Configure the new instance
-  hosts: new_instance
+  hosts: "{{ target | default('new_instance') }}"
   gather_facts: yes
   become: yes
   vars:
@@ -150,29 +156,37 @@
     ssh_pubkey_epam_path: /home/john/.ssh/id_ed25519_epam.pub
     remove_sudo_raw: "{{ remove_sudo | default('no') }}"
     remove_sudo_bool: "{{ remove_sudo_raw | lower in ['yes', 'true', '1'] }}"
+    instance_name: "{{ launch_instance_name | default(inventory_hostname) }}"
 
   tasks:
     - name: Read local SSH public key
       set_fact:
         ssh_pubkey: "{{ lookup('file', ssh_pubkey_path) }}"
+      tags: always
 
-    - name: Read local SSH public key
+    - name: Read local SSH public key (epam)
       set_fact:
         ssh_pubkey_epam: "{{ lookup('file', ssh_pubkey_epam_path) }}"
+      tags: always
 
     - name: Get admin user info
       getent:
         database: passwd
         key: admin
+      tags: always
 
     - name: Set admin uid/gid facts
       set_fact:
         admin_uid: "{{ getent_passwd['admin'][1] }}"
         admin_gid: "{{ getent_passwd['admin'][2] }}"
+      tags: always
+
+    # ── user ──────────────────────────────────────────────────────────────────
 
     - name: Set hostname
       hostname:
         name: "{{ instance_name }}"
+      tags: user
 
     - name: Set FQDN in /etc/hosts
       lineinfile:
@@ -180,6 +194,7 @@
         regexp: '^127\.0\.1\.1'
         line: "127.0.1.1 {{ instance_name }}.critchley.biz {{ instance_name }}"
         insertafter: '^127\.0\.0\.1'
+      tags: user
 
     - name: Ensure root .ssh directory exists
       file:
@@ -188,12 +203,14 @@
         mode: '0700'
         owner: root
         group: root
+      tags: user
 
     - name: Add SSH key to root authorized_keys
       authorized_key:
         user: root
         key: "{{ ssh_pubkey }}"
         state: present
+      tags: user
 
     - name: Enable root SSH login
       lineinfile:
@@ -201,18 +218,21 @@
         regexp: '^#?PermitRootLogin'
         line: 'PermitRootLogin prohibit-password'
       notify: Restart sshd
+      tags: user
 
     - name: Flush handlers to restart sshd before testing root access
       meta: flush_handlers
+      tags: user
 
     - name: Test root SSH access
       delegate_to: localhost
       become: no
-      command: ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -i /home/john/.ssh/id_ed25519 root@{{ ansible_host }} echo "root access works"
+      command: ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -i /home/john/.ssh/id_ed25519 root@{{ hostvars[inventory_hostname]['ansible_host'] | default(inventory_hostname) }} echo "root access works"
       register: root_test
       retries: 3
       delay: 5
       until: root_test.rc == 0
+      tags: user
 
     - name: Create john user with same uid/gid as admin
       user:
@@ -223,28 +243,35 @@
         shell: /bin/bash
         create_home: yes
         non_unique: yes
+      tags: user
 
     - name: Add SSH key to john authorized_keys
       authorized_key:
         user: john
         key: "{{ ssh_pubkey }}"
         state: present
+      tags: user
+
+    # ── packages ──────────────────────────────────────────────────────────────
 
     - name: Install locales package
       apt:
         name: locales
         state: present
         update_cache: yes
+      tags: packages
 
     - name: Generate en_GB.UTF-8 locale
       locale_gen:
         name: en_GB.UTF-8
         state: present
+      tags: packages
 
     - name: Update apt cache and upgrade packages
       apt:
         update_cache: yes
         upgrade: dist
+      tags: packages
 
     - name: Install prerequisites
       apt:
@@ -252,10 +279,13 @@
           - curl
           - ca-certificates
           - rsync
+          - git
           - python-is-python3
           - python3-pip
           - libssl-dev
+          - ansible-core
         state: present
+      tags: packages
 
 #    - name: Copy .bashrc to john home
 #      become: no
@@ -266,14 +296,15 @@
 #        group: "{{ admin_gid }}"
 #        mode: '0644'
 
+    # ── skeleton ──────────────────────────────────────────────────────────────
+
     - name: Rsync weekday/john directory to john home
       become: no
       synchronize:
-        # src: /home/john/.bashrcs/
-        # dest: /home/john/.bashrcs/
         src: /home/john/ansible/weekday/john/
         dest: /home/john/
         recursive: yes
+      tags: skeleton
 
 #    - name: Ensure pip config directory exists
 #      become: no
@@ -291,16 +322,20 @@
 #          break-system-packages = true
 #        mode: '0644'
 
+    # ── nodejs ────────────────────────────────────────────────────────────────
+
     - name: Add NodeSource repository
       shell: curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
       args:
         creates: /etc/apt/sources.list.d/nodesource.list
+      tags: nodejs
 
     - name: Install Node.js
       apt:
         name: nodejs
         state: present
         update_cache: yes
+      tags: nodejs
 
 #    - name: Create npm global directory for john
 #      file:
@@ -325,15 +360,140 @@
 #      environment:
 #        HOME: /home/john
 
-#    - name: Install Claude Code CLI for john
-#      become: no
-#      npm:
-#        name: "@anthropic-ai/claude-code"
-#        global: yes
-#      environment:
-#        HOME: /home/john
-#        PATH: "/home/john/.npm/bin:/usr/bin:/bin"
-#        NPM_CONFIG_PREFIX: "/home/john/.npm"
+    # ── claude ────────────────────────────────────────────────────────────────
+
+    - name: Install Claude Code for john
+      shell: curl -fsSL https://claude.ai/install.sh | bash
+      become: no
+      environment:
+        HOME: /home/john
+      tags: claude
+
+    - name: Copy Claude Code credentials from controller
+      copy:
+        src: "{{ lookup('env', 'HOME') }}/.claude/.credentials.json"
+        dest: /home/john/.claude/.credentials.json
+        owner: john
+        mode: '0600'
+      become: no
+      tags: claude
+
+    - name: Install Python requirements
+      shell: pip3 install --user --break-system-packages -r /home/john/requirements.txt
+      become: no
+      changed_when: false
+      environment:
+        HOME: /home/john
+      tags: claude
+
+    # ── codex ─────────────────────────────────────────────────────────────────
+
+    - name: Read OpenAI API key from controller secrets
+      set_fact:
+        openai_api_key: "{{ lookup('file', lookup('env', 'HOME') + '/ansible/secrets.yml') | from_yaml | json_query('openai_api_key') }}"
+      delegate_to: localhost
+      become: no
+      tags: codex
+
+    - name: Install OpenAI Codex CLI
+      npm:
+        name: "@openai/codex"
+        global: yes
+        state: present
+      tags: codex
+
+    - name: Deploy OPENAI_API_KEY to api_keys bashrcs
+      copy:
+        dest: /home/john/.bashrcs/api_keys
+        content: "export OPENAI_API_KEY={{ openai_api_key }}\n"
+        owner: john
+        mode: '0700'
+      become: no
+      tags: codex
+
+    - name: Log in to Codex with API key
+      shell: echo "{{ openai_api_key }}" | codex login --with-api-key
+      become: no
+      environment:
+        HOME: /home/john
+      tags: codex
+
+    # ── ansible-ctl (make this host an ansible controller) ───────────────────
+
+    - name: Clone or update ansible repo
+      shell: |
+        if [ -d /home/john/ansible/.git ]; then
+          git -C /home/john/ansible pull
+        else
+          git clone git@github.com:john-critchley/ansible.git /home/john/ansible
+        fi
+      become: no
+      changed_when: false
+      tags: ansible-ctl
+
+    - name: Deploy ansible secrets.yml to new controller
+      copy:
+        src: "{{ lookup('env', 'HOME') }}/ansible/secrets.yml"
+        dest: /home/john/ansible/secrets.yml
+        owner: john
+        mode: '0600'
+      become: no
+      tags: ansible-ctl
+
+    - name: Sync weekday skeleton to new controller
+      become: no
+      synchronize:
+        src: "{{ lookup('env', 'HOME') }}/ansible/weekday/"
+        dest: /home/john/ansible/weekday/
+        recursive: yes
+      tags: ansible-ctl
+
+    # ── ask (multi-file document analysis via OpenAI) ────────────────────────
+
+    - name: Create ~/py directory
+      file:
+        path: /home/john/py
+        state: directory
+        owner: john
+        mode: '0755'
+      become: no
+      tags: ask
+
+    - name: Create ~/git directory
+      file:
+        path: /home/john/git
+        state: directory
+        owner: john
+        mode: '0755'
+      become: no
+      tags: ask
+
+    - name: Clone or update ask repository
+      shell: |
+        if [ -d /home/john/git/ask/.git ]; then
+          git -C /home/john/git/ask pull
+        else
+          rm -rf /home/john/git/ask
+          git clone https://github.com/john-critchley/ask.git /home/john/git/ask
+        fi
+      become: no
+      changed_when: false
+      tags: ask
+
+    - name: Install ask Python dependencies
+      shell: pip3 install --user --break-system-packages openai python-docx PyYAML pdfplumber beautifulsoup4 numpy
+      become: no
+      changed_when: false
+      environment:
+        HOME: /home/john
+      tags: ask
+
+    - name: Enable api_keys bashrcs (makes OPENAI_API_KEY available in shell)
+      file:
+        path: /home/john/.bashrcs/api_keys
+        mode: '0700'
+        owner: john
+      tags: ask
 
     - name: Remove sudo package
       apt:
@@ -344,7 +504,7 @@
         SUDO_FORCE_REMOVE: "yes"
       when: remove_sudo_bool
 
-    # ── rc.local / rcs startup framework ──────────────────────────────────────
+    # ── rcs (rc.local / startup framework) ───────────────────────────────────
 
     - name: Read ZoneEdit secrets from controller
       set_fact:
@@ -352,6 +512,7 @@
         zoneedit_token: "{{ lookup('file', lookup('env', 'HOME') + '/ansible/secrets.yml') | from_yaml | json_query('zoneedit_token') }}"
       delegate_to: localhost
       become: no
+      tags: rcs
 
     - name: Deploy /etc/secrets.yml
       copy:
@@ -362,6 +523,7 @@
         content: |
           zoneedit_user: "{{ zoneedit_user }}"
           zoneedit_token: "{{ zoneedit_token }}"
+      tags: rcs
 
     - name: Create /etc/rcs directory
       file:
@@ -370,6 +532,7 @@
         mode: '0755'
         owner: root
         group: root
+      tags: rcs
 
     - name: Deploy /etc/rcs/setdns
       template:
@@ -378,6 +541,7 @@
         mode: '0755'
         owner: root
         group: root
+      tags: rcs
 
     - name: Deploy /etc/rc.local
       copy:
@@ -386,6 +550,7 @@
         mode: '0755'
         owner: root
         group: root
+      tags: rcs
 
     - name: Deploy rc-local systemd unit
       copy:
@@ -408,15 +573,18 @@
 
           [Install]
           WantedBy=multi-user.target
+      tags: rcs
 
     - name: Enable rc-local service
       systemd:
         name: rc-local
         enabled: yes
         daemon_reload: yes
+      tags: rcs
 
     - name: Run rc.local start now
       command: /etc/rc.local start
+      tags: rcs
 
   handlers:
     - name: Restart sshd
