@@ -29,3 +29,6 @@ secrets.yml
 # Python cache
 __pycache__/
 *.pyc
+
+# Scratch/temp working files
+tmp/

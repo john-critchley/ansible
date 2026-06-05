@@ -393,6 +393,7 @@
         openai_api_key: "{{ lookup('file', lookup('env', 'HOME') + '/ansible/secrets.yml') | from_yaml | json_query('openai_api_key') }}"
       delegate_to: localhost
       become: no
+      no_log: true
       tags: codex
 
     - name: Install OpenAI Codex CLI
@@ -409,6 +410,7 @@
         owner: john
         mode: '0700'
       become: no
+      no_log: true
       tags: codex
 
     - name: Log in to Codex with API key
@@ -416,6 +418,7 @@
       become: no
       environment:
         HOME: /home/john
+      no_log: true
       tags: codex
 
     # ── ansible-ctl (make this host an ansible controller) ───────────────────
@@ -495,6 +498,17 @@
         owner: john
       tags: ask
 
+    - name: Ensure ask_gpt alias is present
+      lineinfile:
+        path: /home/john/.bashrcs/aliases
+        regexp: "^alias ask_gpt="
+        line: "alias ask_gpt='/home/john/git/ask/ask.py'"
+        create: yes
+        owner: john
+        mode: '0700'
+      become: no
+      tags: ask
+
     - name: Remove sudo package
       apt:
         name: sudo
@@ -510,8 +524,10 @@
       set_fact:
         zoneedit_user: "{{ lookup('file', lookup('env', 'HOME') + '/ansible/secrets.yml') | from_yaml | json_query('zoneedit_user') }}"
         zoneedit_token: "{{ lookup('file', lookup('env', 'HOME') + '/ansible/secrets.yml') | from_yaml | json_query('zoneedit_token') }}"
+        openai_api_key: "{{ lookup('file', lookup('env', 'HOME') + '/ansible/secrets.yml') | from_yaml | json_query('openai_api_key') }}"
       delegate_to: localhost
       become: no
+      no_log: true
       tags: rcs
 
     - name: Deploy /etc/secrets.yml
@@ -523,6 +539,8 @@
         content: |
           zoneedit_user: "{{ zoneedit_user }}"
           zoneedit_token: "{{ zoneedit_token }}"
+          openai_api_key: "{{ openai_api_key }}"
+      no_log: true
       tags: rcs
 
     - name: Create /etc/rcs directory

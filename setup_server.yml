@@ -1,0 +1,616 @@
+---
+# Set up a bare Debian instance as the application server (noodle replacement).
+#
+# Usage:
+#   ansible-playbook setup_server.yml -e "target=gravlax region=eu-north-1" -e @secrets.yml
+#
+# Run after launch_instance.yml has provisioned the host.
+#
+# Tags:
+#   socks     — dante SOCKS5 proxy
+#   stunnel   — stunnel TLS wrapper (server side)
+#   gdata     — gdata notes REST API server
+#   mcp       — gdata MCP server
+#   apache    — Apache web server, vhosts, htpasswd
+#   certs     — Let's Encrypt certificate issuance (subset of apache)
+#   ports     — AWS security group port opening
+
+- name: Set up application server
+  hosts: "{{ target }}"
+  become: yes
+  gather_facts: yes
+  vars:
+    socks5_port: 1080
+    socks5_listen: "127.0.0.1"
+    stunnel_port: 11080
+    notes_port: 8020
+    notes_stunnel_port: 18021
+    notes_mcp_port: 8023
+    notes_mcp_stunnel_port: 18023
+    gdata_server_src: /home/john/py/gdata-server
+    gdata_server_dest: /home/john/py/gdata-server
+    aws_open_port_path: /home/john/aws/aws_open_port.py
+    region: "{{ aws_region | default('eu-north-1') }}"
+
+  tasks:
+
+    # ── SOCKS5 proxy (microsocks) ─────────────────────────────────────────────
+
+    - name: Install microsocks
+      apt:
+        name: microsocks
+        state: present
+        update_cache: yes
+      tags: socks
+
+    - name: Deploy microsocks systemd unit
+      copy:
+        dest: /etc/systemd/system/microsocks.service
+        mode: '0644'
+        owner: root
+        group: root
+        content: |
+          [Unit]
+          Description=microsocks SOCKS5 proxy
+          After=network.target
+
+          [Service]
+          Type=simple
+          ExecStart=/usr/bin/microsocks -i {{ socks5_listen }} -p {{ socks5_port }}
+          Restart=on-failure
+
+          [Install]
+          WantedBy=multi-user.target
+      notify: Restart microsocks
+      tags: socks
+
+    - name: Enable and start microsocks
+      systemd:
+        name: microsocks
+        enabled: yes
+        state: started
+        daemon_reload: yes
+      tags: socks
+
+    # ── stunnel (TLS wrapper, server side) ───────────────────────────────────
+
+    - name: Install stunnel4
+      apt:
+        name: stunnel4
+        state: present
+      tags: stunnel
+
+    - name: Deploy stunnel server certificate
+      copy:
+        src: /home/john/ssl/C/CA/cert
+        dest: /etc/stunnel/server.pem
+        mode: '0644'
+        owner: root
+        group: root
+      tags: stunnel
+
+    - name: Deploy stunnel server key
+      copy:
+        src: /home/john/ssl/C/CA/key
+        dest: /etc/stunnel/server.key
+        mode: '0600'
+        owner: root
+        group: root
+      tags: stunnel
+
+    - name: Configure stunnel server
+      copy:
+        dest: /etc/stunnel/stunnel.conf
+        mode: '0644'
+        owner: root
+        group: root
+        content: |
+          pid = /var/run/stunnel.pid
+          foreground = no
+          debug = info
+          output = /var/log/stunnel.log
+
+          cert = /etc/stunnel/server.pem
+          key  = /etc/stunnel/server.key
+          CAfile = /etc/stunnel/server.pem
+          verify = 2
+
+          [socks5h]
+          accept  = {{ stunnel_port }}
+          connect = 127.0.0.1:{{ socks5_port }}
+
+          [notes]
+          accept  = {{ notes_stunnel_port }}
+          connect = 127.0.0.1:{{ notes_port }}
+
+          [notes-mcp]
+          accept  = {{ notes_mcp_stunnel_port }}
+          connect = 127.0.0.1:{{ notes_mcp_port }}
+      notify: Restart stunnel
+      tags: stunnel
+
+    - name: Enable stunnel4
+      lineinfile:
+        path: /etc/default/stunnel4
+        regexp: '^ENABLED='
+        line: 'ENABLED=1'
+      notify: Restart stunnel
+      tags: stunnel
+
+    - name: Enable and start stunnel4 service
+      systemd:
+        name: stunnel4
+        enabled: yes
+        state: started
+      tags: stunnel
+
+    # ── gdata-server (notes API) ──────────────────────────────────────────────
+
+    - name: Install system packages for gdata-server
+      apt:
+        name:
+          - python3-gdbm
+        state: present
+      tags: gdata
+
+    - name: Install Python dependencies for gdata-server
+      pip:
+        name:
+          - fastapi
+          - uvicorn
+          - pyyaml
+          - mcp[cli]
+        extra_args: --user --break-system-packages
+        executable: pip3
+      become: no
+      tags: [gdata, mcp]
+
+    - name: Get john user info
+      getent:
+        database: passwd
+        key: john
+      tags: [gdata, mcp]
+
+    - name: Set john gid fact
+      set_fact:
+        john_gid: "{{ getent_passwd['john'][2] }}"
+      tags: [gdata, mcp]
+
+    - name: Create gdata-server directory
+      file:
+        path: "{{ gdata_server_dest }}"
+        state: directory
+        mode: '0755'
+        owner: john
+        group: "{{ john_gid }}"
+      tags: [gdata, mcp]
+
+    - name: Sync gdata_server.py
+      copy:
+        src: "{{ gdata_server_src }}/gdata_server.py"
+        dest: "{{ gdata_server_dest }}/gdata_server.py"
+        owner: john
+        group: "{{ john_gid }}"
+        mode: '0644'
+      notify: Restart gdata-mcp-server
+      tags: gdata
+
+    - name: Deploy gdata module
+      copy:
+        src: /home/john/py/gdata-server/save/gdata.py
+        dest: "{{ gdata_server_dest }}/gdata.py"
+        owner: john
+        group: "{{ john_gid }}"
+        mode: '0644'
+      notify: Restart gdata-mcp-server
+      tags: gdata
+
+    - name: Deploy gdata-server config
+      copy:
+        dest: "{{ gdata_server_dest }}/.gdata_server.yaml"
+        owner: john
+        group: "{{ john_gid }}"
+        mode: '0600'
+        content: |
+          gdbm_file: {{ gdata_server_dest }}/.agent_notes.gdbm
+          gdata_server_port: {{ notes_port }}
+          gdata_server_host: 127.0.0.1
+      notify: Restart gdata-mcp-server
+      tags: gdata
+
+    - name: Copy notes database
+      copy:
+        src: "{{ gdata_server_src }}/.agent_notes.gdbm"
+        dest: "{{ gdata_server_dest }}/.agent_notes.gdbm"
+        owner: john
+        group: "{{ john_gid }}"
+        mode: '0600'
+        force: no
+      tags: gdata
+
+    - name: Deploy gdata-server systemd unit
+      copy:
+        dest: /etc/systemd/system/gdata-server.service
+        mode: '0644'
+        owner: root
+        group: root
+        content: |
+          [Unit]
+          Description=gdata notes API server
+          After=network.target
+
+          [Service]
+          Type=simple
+          User=john
+          WorkingDirectory={{ gdata_server_dest }}
+          Environment=GDATA_SERVER_HTTP=1
+          Environment=PYTHONUSERBASE=/home/john/.local
+          ExecStart=/usr/bin/python3 {{ gdata_server_dest }}/gdata_server.py
+          Restart=on-failure
+          StandardOutput=journal
+          StandardError=journal
+
+          [Install]
+          WantedBy=multi-user.target
+      notify: Restart gdata-mcp-server
+      tags: gdata
+
+    - name: Disable gdata-server (gdata-mcp-server owns the GDBM file exclusively)
+      systemd:
+        name: gdata-server
+        enabled: no
+        state: stopped
+        daemon_reload: yes
+      tags: gdata
+
+    # ── gdata MCP server ──────────────────────────────────────────────────────
+
+    - name: Sync gdata_mcp_server.py
+      copy:
+        src: "{{ gdata_server_src }}/gdata_mcp_server.py"
+        dest: "{{ gdata_server_dest }}/gdata_mcp_server.py"
+        owner: john
+        group: "{{ john_gid }}"
+        mode: '0644'
+      notify: Restart gdata-mcp-server
+      tags: mcp
+
+    - name: Sync gdata_oauth.py
+      copy:
+        src: "{{ gdata_server_src }}/gdata_oauth.py"
+        dest: "{{ gdata_server_dest }}/gdata_oauth.py"
+        owner: john
+        group: "{{ john_gid }}"
+        mode: '0644'
+      notify: Restart gdata-mcp-server
+      tags: mcp
+
+    - name: Sync notes_web.py
+      copy:
+        src: "{{ gdata_server_src }}/notes_web.py"
+        dest: "{{ gdata_server_dest }}/notes_web.py"
+        owner: john
+        group: "{{ john_gid }}"
+        mode: '0644'
+      notify: Restart gdata-mcp-server
+      tags: mcp
+
+    - name: Deploy OAuth env file
+      copy:
+        dest: /etc/gdata_oauth.env
+        mode: '0640'
+        owner: root
+        group: "{{ john_gid }}"
+        content: |
+          OAUTH_CLIENT_ID={{ oauth_client_id }}
+          OAUTH_CLIENT_SECRET={{ oauth_client_secret }}
+          OAUTH_PASSWORD={{ oauth_password }}
+          OAUTH_ISSUER={{ oauth_issuer }}
+          OAUTH_TOKEN_FILE=/home/john/.oauth_tokens.json
+      notify: Restart gdata-mcp-server
+      tags: mcp
+
+    - name: Create OAuth token store with bearer token
+      copy:
+        dest: /home/john/.oauth_tokens.json
+        owner: john
+        group: "{{ john_gid }}"
+        mode: '0600'
+        force: no
+        content: |
+          {
+            "codes": {},
+            "tokens": {
+              "{{ mcp_bearer_token }}": { "exp": {{ (ansible_date_time.epoch | int) + 31536000 }} }
+            }
+          }
+      tags: mcp
+
+    - name: Deploy gdata-mcp-server systemd unit
+      copy:
+        dest: /etc/systemd/system/gdata-mcp-server.service
+        mode: '0644'
+        owner: root
+        group: root
+        content: |
+          [Unit]
+          Description=gdata MCP+REST server
+          After=network.target
+
+          [Service]
+          Type=simple
+          User=john
+          WorkingDirectory={{ gdata_server_dest }}
+          EnvironmentFile=/etc/gdata_oauth.env
+          Environment=PYTHONUSERBASE=/home/john/.local
+          ExecStart=/usr/bin/python3 {{ gdata_server_dest }}/gdata_mcp_server.py \
+            --db {{ gdata_server_dest }}/.agent_notes.gdbm \
+            --mcp-port {{ notes_mcp_port }} \
+            --rest-port 8020
+          Restart=on-failure
+          StandardOutput=journal
+          StandardError=journal
+
+          [Install]
+          WantedBy=multi-user.target
+      notify: Restart gdata-mcp-server
+      tags: mcp
+
+    - name: Enable and start gdata-mcp-server
+      systemd:
+        name: gdata-mcp-server
+        enabled: yes
+        state: started
+        daemon_reload: yes
+      tags: mcp
+
+    # ── Apache web server ────────────────────────────────────────────────────
+
+    - name: Install apache2 and certbot
+      apt:
+        name:
+          - apache2
+          - certbot
+          - python3-certbot-apache
+          - apache2-utils
+        state: present
+      tags: apache
+
+    - name: Enable required Apache modules
+      apache2_module:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - ssl
+        - proxy
+        - proxy_http
+        - autoindex
+        - dav
+        - dav_fs
+        - headers
+        - rewrite
+      notify: Restart apache
+      tags: apache
+
+    - name: Disable default Apache site
+      command: a2dissite 000-default
+      args:
+        removes: /etc/apache2/sites-enabled/000-default.conf
+      notify: Restart apache
+      tags: apache
+
+    - name: Create document roots and ACME webroot
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+        owner: www-data
+        group: www-data
+      loop:
+        - /var/www/www.critchley.biz
+        - /var/www/cv.critchley.biz
+        - /var/www/webdav
+        - /var/www/acme-challenge
+      tags: apache
+
+    - name: Create WebDAV lock directory
+      file:
+        path: /var/lock/apache2
+        state: directory
+        mode: '0755'
+        owner: www-data
+        group: www-data
+      tags: apache
+
+    - name: Create WebDAV htpasswd file
+      shell: htpasswd -b -c /etc/apache2/.htpasswd-webdav john "{{ webdav_pass }}"
+      args:
+        creates: /etc/apache2/.htpasswd-webdav
+      when: webdav_pass != 'CHANGEME'
+      tags: apache
+
+    - name: Create gdata API htpasswd file
+      shell: htpasswd -b -c /etc/apache2/.htpasswd-gdata john "{{ gdata_api_pass }}"
+      args:
+        creates: /etc/apache2/.htpasswd-gdata
+      when: gdata_api_pass != 'CHANGEME'
+      tags: apache
+
+    - name: Deploy HTTP vhost configs
+      copy:
+        src: "files/apache/{{ item }}"
+        dest: "/etc/apache2/sites-available/{{ item }}"
+        mode: '0644'
+      loop:
+        - www.critchley.biz-http.conf
+        - cv.critchley.biz-http.conf
+        - webdav.critchley.biz-http.conf
+      notify: Restart apache
+      tags: apache
+
+    - name: Enable HTTP vhosts
+      command: a2ensite {{ item }}
+      args:
+        creates: "/etc/apache2/sites-enabled/{{ item }}"
+      loop:
+        - www.critchley.biz-http.conf
+        - cv.critchley.biz-http.conf
+        - webdav.critchley.biz-http.conf
+      notify: Restart apache
+      tags: apache
+
+    - name: Start Apache
+      systemd:
+        name: apache2
+        enabled: yes
+        state: started
+      tags: apache
+
+    # ── Open HTTP/HTTPS ports before certbot can run ─────────────────────────
+
+    - name: Get controller external IP via DNS
+      command: python3 -c "import socket; print(socket.gethostbyname('home.critchley.biz'))"
+      register: controller_ip_result
+      delegate_to: localhost
+      become: no
+      changed_when: false
+      tags: [apache, certs, ports, stunnel, gdata, mcp]
+
+    - name: Get instance ID from /etc/hosts
+      command: >
+        awk '/[ \t]{{ inventory_hostname }}[ \t]/{print $NF}' /etc/hosts
+      register: instance_id_result
+      delegate_to: localhost
+      become: no
+      changed_when: false
+      tags: [apache, certs, ports, stunnel, gdata, mcp]
+
+    - name: Open HTTP port to world
+      command: >
+        {{ aws_open_port_path }}
+        {{ instance_id_result.stdout | trim }}
+        80 any
+        --region {{ region }}
+      delegate_to: localhost
+      become: no
+      tags: [apache, certs, ports]
+
+    - name: Open HTTPS port to world
+      command: >
+        {{ aws_open_port_path }}
+        {{ instance_id_result.stdout | trim }}
+        443 any
+        --region {{ region }}
+      delegate_to: localhost
+      become: no
+      tags: [apache, certs, ports]
+
+    - name: Flush handlers to ensure Apache is running before certbot
+      meta: flush_handlers
+      tags: [apache, certs]
+
+    - name: Obtain Let's Encrypt certificate for www.critchley.biz
+      command: >
+        certbot certonly --webroot -w /var/www/www.critchley.biz
+        -d www.critchley.biz
+        --non-interactive --agree-tos -m john@critchley.biz
+      args:
+        creates: /etc/letsencrypt/live/www.critchley.biz/fullchain.pem
+      tags: [apache, certs]
+
+    - name: Obtain Let's Encrypt certificate for cv.critchley.biz
+      command: >
+        certbot certonly --webroot -w /var/www/cv.critchley.biz
+        -d cv.critchley.biz
+        --non-interactive --agree-tos -m john@critchley.biz
+      args:
+        creates: /etc/letsencrypt/live/cv.critchley.biz/fullchain.pem
+      tags: [apache, certs]
+
+    - name: Obtain Let's Encrypt certificate for webdav.critchley.biz
+      command: >
+        certbot certonly --webroot -w /var/www/webdav
+        -d webdav.critchley.biz
+        --non-interactive --agree-tos -m john@critchley.biz
+      args:
+        creates: /etc/letsencrypt/live/webdav.critchley.biz/fullchain.pem
+      tags: [apache, certs]
+
+    - name: Deploy HTTPS vhost configs
+      copy:
+        src: "files/apache/{{ item }}"
+        dest: "/etc/apache2/sites-available/{{ item }}"
+        mode: '0644'
+      loop:
+        - www.critchley.biz-ssl.conf
+        - cv.critchley.biz-ssl.conf
+        - webdav.critchley.biz-ssl.conf
+      notify: Restart apache
+      tags: apache
+
+    - name: Enable HTTPS vhosts
+      command: a2ensite {{ item }}
+      args:
+        creates: "/etc/apache2/sites-enabled/{{ item }}"
+      loop:
+        - www.critchley.biz-ssl.conf
+        - cv.critchley.biz-ssl.conf
+        - webdav.critchley.biz-ssl.conf
+      notify: Restart apache
+      tags: apache
+
+    # ── Open stunnel ports in AWS security group (controller IP only) ─────────
+
+    - name: Open stunnel port to controller IP only
+      command: >
+        {{ aws_open_port_path }}
+        {{ instance_id_result.stdout | trim }}
+        {{ stunnel_port }}
+        {{ controller_ip_result.stdout | trim }}/32
+        --region {{ region }}
+      delegate_to: localhost
+      become: no
+      tags: [stunnel, ports]
+
+    - name: Open notes stunnel port to controller IP only
+      command: >
+        {{ aws_open_port_path }}
+        {{ instance_id_result.stdout | trim }}
+        {{ notes_stunnel_port }}
+        {{ controller_ip_result.stdout | trim }}/32
+        --region {{ region }}
+      delegate_to: localhost
+      become: no
+      tags: [gdata, ports]
+
+    - name: Open notes MCP stunnel port to controller IP only
+      command: >
+        {{ aws_open_port_path }}
+        {{ instance_id_result.stdout | trim }}
+        {{ notes_mcp_stunnel_port }}
+        {{ controller_ip_result.stdout | trim }}/32
+        --region {{ region }}
+      delegate_to: localhost
+      become: no
+      tags: [mcp, ports]
+
+  handlers:
+    - name: Restart microsocks
+      systemd:
+        name: microsocks
+        state: restarted
+
+    - name: Restart stunnel
+      systemd:
+        name: stunnel4
+        state: restarted
+
+    - name: Restart gdata-mcp-server
+      systemd:
+        name: gdata-mcp-server
+        state: restarted
+
+    - name: Restart apache
+      systemd:
+        name: apache2
+        state: restarted

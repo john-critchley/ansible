@@ -1,0 +1,117 @@
+---
+# Add a new EBS volume for /home on an existing instance.
+#
+# Usage:
+#   ansible-playbook add_home_disk.yml -e "target=kelp region=eu-central-1"
+#
+# Creates a 4 GB gp3 volume, attaches it, formats it, migrates /home onto it,
+# and adds a permanent fstab entry.  The old /home tree is left intact at /h.
+
+- name: Create and attach EBS volume
+  hosts: localhost
+  gather_facts: no
+  vars:
+    target_host: "{{ target }}"
+    region: "{{ region | default('eu-central-1') }}"
+
+  tasks:
+    - name: Get instance ID and AZ for {{ target_host }}
+      command: python3 files/lookup_instance.py {{ target_host }} {{ region }}
+      register: inst_info
+      changed_when: false
+
+    - name: Parse instance ID and AZ
+      set_fact:
+        instance_id: "{{ inst_info.stdout.split()[0] }}"
+        avail_zone: "{{ inst_info.stdout.split()[1] }}"
+
+    - name: Create and attach 4 GB gp3 volume
+      command: >-
+        python3 files/attach_home_volume.py
+        --instance-id {{ instance_id }}
+        --az {{ avail_zone }}
+        --region {{ region }}
+        --host {{ target_host }}
+      register: vol_out
+
+    - name: Show attached volume ID
+      debug:
+        msg: "Attached volume {{ vol_out.stdout.strip() }}"
+
+- name: Format, migrate, and mount /home
+  hosts: "{{ target }}"
+  become: yes
+
+  tasks:
+    - name: Wait for new block device to appear
+      shell: |
+        ROOT_DEV=$(findmnt -n -o SOURCE / | sed 's/p\?[0-9]*$//')
+        for i in $(seq 1 20); do
+          dev=$(lsblk -b -o NAME,SIZE,TYPE --noheadings \
+            | awk -v root="$ROOT_DEV" \
+              '$3=="disk" && "/dev/"$1!=root && $2>1073741824 && $2<6442450944 {print "/dev/"$1; exit}')
+          [ -n "$dev" ] && echo "$dev" && exit 0
+          sleep 2
+        done
+        exit 1
+      register: new_dev
+      changed_when: false
+
+    - name: Set device fact
+      set_fact:
+        home_dev: "{{ new_dev.stdout.strip() }}"
+
+    - name: Format {{ home_dev }} as ext4
+      filesystem:
+        fstype: ext4
+        dev: "{{ home_dev }}"
+
+    - name: Mount new volume at /mnt
+      mount:
+        path: /mnt
+        src: "{{ home_dev }}"
+        fstype: ext4
+        state: mounted
+
+    - name: Rsync /home/ to /mnt/
+      command: rsync -a /home/ /mnt/
+
+    - name: Get UUID of new volume
+      command: blkid -s UUID -o value {{ home_dev }}
+      register: blkid_out
+      changed_when: false
+
+    - name: Set UUID fact
+      set_fact:
+        home_uuid: "{{ blkid_out.stdout.strip() }}"
+
+    - name: Unmount /mnt
+      mount:
+        path: /mnt
+        state: unmounted
+
+    - name: Rename /home to /h
+      command: mv /home /h
+      args:
+        creates: /h
+
+    - name: Create new /home mountpoint
+      file:
+        path: /home
+        state: directory
+        mode: '0755'
+
+    - name: Add /home to fstab
+      mount:
+        path: /home
+        src: "UUID={{ home_uuid }}"
+        fstype: ext4
+        opts: defaults
+        state: present
+
+    - name: Mount /home
+      command: mount /home
+
+    - name: Verify /home is mounted
+      command: mountpoint -q /home
+      changed_when: false
