@@ -114,6 +114,7 @@
         {{ '--project ' + project if project is defined else '' }}
       delegate_to: localhost
       become: no
+      ignore_errors: yes
 
     - name: Add new host to in-memory inventory
       add_host:
@@ -121,7 +122,7 @@
         ansible_host: "{{ instance_ip }}"
         ansible_user: admin
         ansible_ssh_private_key_file: "/home/john/.ssh/{{ launch_instance_name }}.pem"
-        ansible_ssh_common_args: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+        ansible_ssh_common_args: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ForwardAgent=yes"
         instance_name: "{{ launch_instance_name }}"
         groups: new_instance
 
@@ -423,12 +424,28 @@
 
     # ── ansible-ctl (make this host an ansible controller) ───────────────────
 
+    - name: Deploy admin SSH config for GitHub agent forwarding
+      copy:
+        dest: /home/admin/.ssh/config
+        owner: admin
+        mode: '0600'
+        content: |
+          Host github.com
+              HostName github.com
+              User git
+
+          Host *
+              ServerAliveInterval 60
+              ServerAliveCountMax 10
+              TCPKeepAlive yes
+      tags: ansible-ctl
+
     - name: Clone or update ansible repo
       shell: |
         if [ -d /home/john/ansible/.git ]; then
           git -C /home/john/ansible pull
         else
-          git clone git@github.com:john-critchley/ansible.git /home/john/ansible
+          git clone https://github.com/john-critchley/ansible.git /home/john/ansible
         fi
       become: no
       changed_when: false
@@ -449,6 +466,49 @@
         src: "{{ lookup('env', 'HOME') }}/ansible/weekday/"
         dest: /home/john/ansible/weekday/
         recursive: yes
+      tags: ansible-ctl
+
+    - name: Read AWS credentials from controller secrets
+      set_fact:
+        aws_access_key_id: "{{ lookup('file', lookup('env', 'HOME') + '/ansible/secrets.yml') | from_yaml | json_query('aws_access_key_id') }}"
+        aws_secret_access_key: "{{ lookup('file', lookup('env', 'HOME') + '/ansible/secrets.yml') | from_yaml | json_query('aws_secret_access_key') }}"
+      delegate_to: localhost
+      become: no
+      no_log: true
+      tags: ansible-ctl
+
+    - name: Create ~/.aws directory on new controller
+      file:
+        path: /home/john/.aws
+        state: directory
+        owner: john
+        mode: '0700'
+      become: no
+      tags: ansible-ctl
+
+    - name: Deploy ~/.aws/credentials to new controller
+      copy:
+        dest: /home/john/.aws/credentials
+        owner: john
+        mode: '0600'
+        content: |
+          [default]
+          aws_access_key_id = {{ aws_access_key_id }}
+          aws_secret_access_key = {{ aws_secret_access_key }}
+
+          [singapore]
+          aws_access_key_id = {{ aws_access_key_id }}
+          aws_secret_access_key = {{ aws_secret_access_key }}
+
+          [frankfurt]
+          aws_access_key_id = {{ aws_access_key_id }}
+          aws_secret_access_key = {{ aws_secret_access_key }}
+
+          [stockholm]
+          aws_access_key_id = {{ aws_access_key_id }}
+          aws_secret_access_key = {{ aws_secret_access_key }}
+      become: no
+      no_log: true
       tags: ansible-ctl
 
     # ── ask (multi-file document analysis via OpenAI) ────────────────────────
