@@ -307,6 +307,17 @@
         recursive: yes
       tags: skeleton
 
+    - name: Deploy ~/.netrc for WebDAV access
+      copy:
+        dest: /home/john/.netrc
+        mode: '0600'
+        content: |
+          machine webdav.critchley.biz login john password {{ webdav_pass }}
+      become: no
+      when: webdav_pass is defined and webdav_pass != 'CHANGEME'
+      no_log: true
+      tags: skeleton
+
 #    - name: Ensure pip config directory exists
 #      become: no
 #      file:
