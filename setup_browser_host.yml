@@ -220,7 +220,11 @@
         dest: /etc/stunnel/vnc-client.conf.sample
         mode: '0644'
         content: |
-          ; VNC client-side stunnel — run on the Mac / pomelo / any viewer host.
+          ; VNC client-side stunnel — OPTIONAL. Primary use is headless from the
+          ; controller (kelp); this is only for viewing from the Mac if wanted.
+          ; No public DNS is used: 'connect' is the host's current IP (it changes
+          ; on relaunch — refresh from the hosts registry note or
+          ; ~/later/instance.env), while 'checkHost' pins the server cert CN.
           ; Then point a RealVNC/TigerVNC viewer at localhost:5901.
           verify = 2
           CAfile = ca.pem
@@ -230,7 +234,7 @@
           [vnc]
           client = yes
           accept = 5901
-          connect = {{ vnc_cert_cn }}:{{ vnc_stunnel_port }}
+          connect = {{ ansible_host | default(inventory_hostname) }}:{{ vnc_stunnel_port }}
           checkHost = {{ vnc_cert_cn }}
       tags: stunnel
 
