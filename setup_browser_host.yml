@@ -8,8 +8,8 @@
 #
 # Usage:
 #   ansible-playbook setup_browser_host.yml -e "target=<host>" -e @secrets.yml
-#   # size it with enough memory to avoid swap, e.g. launch as t3.large (8 GB):
-#   ./launch_instance.sh --instance-name <host> --region eu-central-1 --instance-type t3.large
+#   # size for memory (must not swap) — ARM Graviton t4g.large (8 GB):
+#   ./launch_instance.sh --instance-name shiitake --region eu-central-1 --instance-type t4g.large
 #
 # Run after launch_instance.yml (and the base playbook.yml) have provisioned the
 # host. See notes: ansible/aws-browser-host.
