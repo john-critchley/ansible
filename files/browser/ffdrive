@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+# ffdrive - deterministically drive the Firefox window on VNC display :1, then
+# return the view to the Claude terminal.
+#
+# Flow for every action: activate Firefox BY NAME (windowactivate --sync) so the
+# keystrokes/clicks always land in Firefox regardless of which XFCE workspace the
+# human is viewing or what had focus -> perform the action -> optionally shot ->
+# switch focus/view back to the Claude Konsole window, so the operator is left
+# looking at this terminal between steps.
+#
+# Pass --stay to remain on Firefox instead of returning (useful for chaining).
+set -euo pipefail
+
+export DISPLAY=:1
+FF_NAME="Mozilla Firefox"
+TERM_CLASS="${FFDRIVE_TERM_CLASS:-konsole}"
+TERM_NAME="${FFDRIVE_TERM_NAME:-claude}"   # prefer the konsole running Claude
+SHOTDIR="$HOME/tmp"
+TYPE_DELAY=30   # ms between keystrokes; slow enough Firefox never drops leading chars
+
+# --- window helpers ---------------------------------------------------------
+ff_id() { xdotool search --name "$FF_NAME" | head -1; }
+
+term_id() {
+  local id
+  id="$(xdotool search --class "$TERM_CLASS" --name "$TERM_NAME" 2>/dev/null | head -1)"
+  [ -z "$id" ] && id="$(xdotool search --class "$TERM_CLASS" 2>/dev/null | tail -1)"
+  printf '%s' "$id"
+}
+
+activate_ff() {
+  local id; id="$(ff_id)"
+  if [ -z "$id" ]; then echo "ERROR: no '$FF_NAME' window on $DISPLAY" >&2; exit 1; fi
+  xdotool windowactivate --sync "$id" 2>/dev/null
+  sleep 0.25   # let the WM raise/focus before sending input
+  printf '%s' "$id"
+}
+
+return_to_terminal() {
+  [ "${STAY:-0}" = "1" ] && return 0
+  local tid; tid="$(term_id || true)"
+  if [ -n "${tid:-}" ]; then
+    xdotool windowactivate --sync "$tid" 2>/dev/null || true
+  fi
+}
+
+shot() {
+  local name="${1:-ff_$(date +%H%M%S)}"
+  local out="$SHOTDIR/${name}.png"
+  import -window root "$out"
+  echo "$out"
+}
+
+# --- arg parse: pull out --stay anywhere --------------------------------------
+STAY=0
+args=()
+for a in "$@"; do
+  if [ "$a" = "--stay" ]; then STAY=1; else args+=("$a"); fi
+done
+set -- "${args[@]}"
+
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  max)
+    # restore Firefox to full-screen size at 0,0 (recovers from stray tiling)
+    id="$(ff_id)"
+    if [ -z "$id" ]; then echo "ERROR: no '$FF_NAME' window on $DISPLAY" >&2; exit 1; fi
+    read -r SW SH < <(xdotool getdisplaygeometry)
+    xdotool windowactivate --sync "$id" 2>/dev/null
+    xdotool windowmove "$id" 0 0
+    xdotool windowsize "$id" "$SW" "$SH"
+    sleep 0.3
+    echo "maximized Firefox to ${SW}x${SH}"
+    ;;
+  activate)
+    # purpose is to bring Firefox forward and leave it there
+    id="$(STAY=1 activate_ff)"; echo "Firefox activated (id $id)"
+    ;;
+  goto)
+    [ $# -ge 1 ] || { echo "usage: ffdrive goto <url>" >&2; exit 2; }
+    activate_ff >/dev/null
+    xdotool key --clearmodifiers ctrl+l          # focus address bar
+    sleep 0.25
+    xdotool key --clearmodifiers ctrl+a Delete
+    xdotool type --clearmodifiers --delay "$TYPE_DELAY" "$1"
+    sleep 0.2
+    xdotool key --clearmodifiers Return
+    echo "navigated to: $1"
+    return_to_terminal
+    ;;
+  type)
+    activate_ff >/dev/null
+    xdotool type --clearmodifiers --delay "$TYPE_DELAY" "$*"
+    echo "typed: $*"
+    return_to_terminal
+    ;;
+  key)
+    [ $# -ge 1 ] || { echo "usage: ffdrive key <chord...>" >&2; exit 2; }
+    activate_ff >/dev/null
+    xdotool key --clearmodifiers "$@"
+    echo "sent keys: $*"
+    return_to_terminal
+    ;;
+  click)
+    [ $# -eq 2 ] || { echo "usage: ffdrive click <x> <y>" >&2; exit 2; }
+    activate_ff >/dev/null
+    xdotool mousemove --sync "$1" "$2" click 1
+    echo "clicked $1,$2"
+    return_to_terminal
+    ;;
+  shot)
+    # ensure Firefox is the thing on screen, capture, then return to terminal
+    activate_ff >/dev/null
+    out="$(shot "${1:-}")"
+    echo "$out"
+    return_to_terminal
+    ;;
+  *)
+    echo "usage: ffdrive [--stay] {activate|goto <url>|type <text>|key <chord...>|click <x> <y>|shot [name]}" >&2
+    exit 2
+    ;;
+esac
