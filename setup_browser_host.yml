@@ -33,6 +33,9 @@
     vnc_depth: "24"
     vnc_rfb_port: 5901          # 5900 + display
     vnc_stunnel_port: 15901     # TLS front for the VNC RFB port
+    vnc_cert_cn: "{{ inventory_hostname_short }}.critchley.biz"
+    vnc_client_cn: "vnc-client"
+    vnc_bundle_fetch_dir: "/home/john/ssl/browser-hosts"
 
   tasks:
 
@@ -147,25 +150,103 @@
         state: present
       tags: stunnel
 
-    # NOTE (T3): reuse the server cert/key that setup_server.yml deploys. mTLS
-    # client CA + per-host client bundle are still to be wired up — see the
-    # ansible/aws-browser-host note, task T3.
-    - name: Deploy stunnel server certificate
-      copy:
-        src: /home/john/ssl/C/CA/cert
-        dest: /etc/stunnel/server.pem
-        mode: '0644'
-        owner: root
-        group: root
+    # T3: this host is its own independent trust domain (ssl-patterns
+    # hub-and-spoke), NOT the shared pomelo-rooted CA. A fresh self-signed cert
+    # is generated on the host and used as BOTH the stunnel server leaf and the
+    # CA that verifies inbound clients (CAfile = server.pem, verify = 2). A
+    # client cert signed by it is issued for remote viewers (Mac/pomelo). The
+    # CA private key never leaves this throwaway host. See notes ssl-patterns,
+    # ssl/pki, ssl/create-certs (pattern), ~/py/ssl/gen_certs.sh.
+    - name: Ensure /etc/stunnel exists
+      file:
+        path: /etc/stunnel
+        state: directory
+        mode: '0755'
       tags: stunnel
 
-    - name: Deploy stunnel server key
-      copy:
-        src: /home/john/ssl/C/CA/key
-        dest: /etc/stunnel/server.key
-        mode: '0600'
+    - name: Generate self-signed server/CA cert (server leaf doubles as client CA)
+      command: >
+        openssl req -x509 -newkey rsa:2048 -nodes -days 365
+        -keyout /etc/stunnel/server.key -out /etc/stunnel/server.pem
+        -subj "/CN={{ vnc_cert_cn }}"
+      args:
+        creates: /etc/stunnel/server.pem
+      tags: stunnel
+
+    - name: Secure the server key and cert
+      file:
+        path: "{{ item.path }}"
         owner: root
         group: root
+        mode: "{{ item.mode }}"
+      loop:
+        - { path: /etc/stunnel/server.key, mode: '0600' }
+        - { path: /etc/stunnel/server.pem, mode: '0644' }
+      tags: stunnel
+
+    - name: Generate VNC client key
+      command: openssl genrsa -out /etc/stunnel/vnc-client.key 2048
+      args:
+        creates: /etc/stunnel/vnc-client.key
+      tags: stunnel
+
+    - name: Generate VNC client CSR
+      command: >
+        openssl req -new -key /etc/stunnel/vnc-client.key
+        -out /etc/stunnel/vnc-client.csr -subj "/CN={{ vnc_client_cn }}"
+      args:
+        creates: /etc/stunnel/vnc-client.csr
+      tags: stunnel
+
+    - name: Sign the VNC client cert with the host CA
+      command: >
+        openssl x509 -req -in /etc/stunnel/vnc-client.csr
+        -CA /etc/stunnel/server.pem -CAkey /etc/stunnel/server.key
+        -CAcreateserial -out /etc/stunnel/vnc-client.crt -days 365
+      args:
+        creates: /etc/stunnel/vnc-client.crt
+      tags: stunnel
+
+    - name: Provide CA cert (= server cert) copy for the client bundle
+      copy:
+        src: /etc/stunnel/server.pem
+        dest: /etc/stunnel/ca.pem
+        remote_src: yes
+        mode: '0644'
+      tags: stunnel
+
+    - name: Write a sample client stunnel conf for viewers
+      copy:
+        dest: /etc/stunnel/vnc-client.conf.sample
+        mode: '0644'
+        content: |
+          ; VNC client-side stunnel — run on the Mac / pomelo / any viewer host.
+          ; Then point a RealVNC/TigerVNC viewer at localhost:5901.
+          verify = 2
+          CAfile = ca.pem
+          cert   = vnc-client.crt
+          key    = vnc-client.key
+
+          [vnc]
+          client = yes
+          accept = 5901
+          connect = {{ vnc_cert_cn }}:{{ vnc_stunnel_port }}
+          checkHost = {{ vnc_cert_cn }}
+      tags: stunnel
+
+    - name: Stage the client bundle (ca.pem + client cert/key + sample conf)
+      command: >
+        tar -czf /etc/stunnel/vnc-client-bundle.tar.gz
+        -C /etc/stunnel ca.pem vnc-client.crt vnc-client.key vnc-client.conf.sample
+      args:
+        creates: /etc/stunnel/vnc-client-bundle.tar.gz
+      tags: stunnel
+
+    - name: Fetch the client bundle back to the controller
+      fetch:
+        src: /etc/stunnel/vnc-client-bundle.tar.gz
+        dest: "{{ vnc_bundle_fetch_dir }}/{{ inventory_hostname_short }}/"
+        flat: yes
       tags: stunnel
 
     - name: Configure stunnel VNC front (mTLS)
