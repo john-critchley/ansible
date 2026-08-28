@@ -1,0 +1,198 @@
+---
+# Configure a host as a Firefox+VNC browser host. Idempotent; safe to re-run.
+# The imperative bits (Firefox profile mint/discovery) are shell tasks; the file
+# placement around them is done with proper modules.
+
+- name: Install browser, desktop and VNC packages
+  apt:
+    name:
+      - firefox-esr
+      - xfce4
+      - dbus-x11
+      - x11-xserver-utils
+      - xdotool
+      - wmctrl
+      - imagemagick
+      - libheif1          # HEIC delegate for iPhone tickets
+      - fonts-dejavu
+      - fonts-liberation
+      - tigervnc-standalone-server
+      - tigervnc-common
+    state: present
+    update_cache: yes
+  tags: packages
+
+- name: Ensure ~/.vnc and ~/bin exist
+  file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ browser_user }}"
+    group: "{{ browser_user }}"
+    mode: "0755"
+  loop:
+    - "{{ browser_home }}/.vnc"
+    - "{{ browser_home }}/bin"
+  tags: vnc
+
+- name: Deploy VNC xstartup (XFCE session)
+  copy:
+    src: xstartup
+    dest: "{{ browser_home }}/.vnc/xstartup"
+    owner: "{{ browser_user }}"
+    group: "{{ browser_user }}"
+    mode: "0755"
+  tags: vnc
+
+- name: Deploy per-user VNC config (localhost-only, no auth)
+  copy:
+    dest: "{{ browser_home }}/.vnc/config"
+    owner: "{{ browser_user }}"
+    group: "{{ browser_user }}"
+    mode: "0644"
+    content: |
+      geometry={{ vnc_geometry }}
+      depth={{ vnc_depth }}
+      localhost
+      SecurityTypes=None
+  tags: vnc
+
+- name: Map display :{{ vnc_display }} to {{ browser_user }}
+  lineinfile:
+    path: /etc/tigervnc/vncserver.users
+    create: yes
+    regexp: "^:{{ vnc_display }}="
+    line: ":{{ vnc_display }}={{ browser_user }}"
+    mode: "0644"
+  tags: vnc
+
+- name: Enable and start tigervncserver@:{{ vnc_display }}
+  systemd:
+    name: "tigervncserver@:{{ vnc_display }}.service"
+    enabled: yes
+    state: started
+    daemon_reload: yes
+  tags: vnc
+
+- name: Deploy ffdrive wrapper
+  copy:
+    src: ffdrive
+    dest: "{{ browser_home }}/bin/ffdrive"
+    owner: "{{ browser_user }}"
+    group: "{{ browser_user }}"
+    mode: "0755"
+  tags: ffdrive
+
+# ── stunnel server + per-host viewer certs (tag: stunnel) ──────────────────
+# The host is its own CA: its self-signed server cert doubles as the CA that
+# signs the registered viewer CSRs (kelp/Mac/pomelo), so each client gets a
+# per-host cert. mTLS (verify=2) on vnc_stunnel_port fronts the VNC RFB port.
+- name: Install stunnel4
+  apt: {name: stunnel4, state: present}
+  tags: stunnel
+
+- name: Generate the host self-signed server/CA cert
+  command: >
+    openssl req -x509 -newkey rsa:2048 -nodes -days 30
+    -keyout /etc/stunnel/server.key -out /etc/stunnel/server.pem
+    -subj "/CN={{ inventory_hostname_short }}.critchley.biz"
+    -addext "subjectAltName=DNS:{{ inventory_hostname_short }}.critchley.biz"
+  args: {creates: /etc/stunnel/server.pem}
+  tags: stunnel
+
+- name: Secure the server key
+  file: {path: /etc/stunnel/server.key, owner: root, group: root, mode: "0600"}
+  tags: stunnel
+
+- name: Directory for viewer CSRs + issued certs
+  file: {path: /etc/stunnel/clients, state: directory, mode: "0755"}
+  tags: stunnel
+
+- name: Copy registered viewer CSRs onto the host
+  copy:
+    src: "{{ item }}"
+    dest: "/etc/stunnel/clients/{{ item | basename }}"
+    mode: "0644"
+  with_fileglob: "{{ viewer_csr_dir }}/*.csr"
+  tags: stunnel
+
+- name: Sign each viewer CSR with the host CA -> per-host client cert
+  shell: |
+    n="{{ (item | basename | splitext)[0] }}"
+    openssl x509 -req -in "/etc/stunnel/clients/{{ item | basename }}" \
+      -CA /etc/stunnel/server.pem -CAkey /etc/stunnel/server.key -CAcreateserial \
+      -out "/etc/stunnel/clients/$n.crt" -days 30
+  args:
+    creates: "/etc/stunnel/clients/{{ (item | basename | splitext)[0] }}.crt"
+  with_fileglob: "{{ viewer_csr_dir }}/*.csr"
+  tags: stunnel
+
+- name: Configure the stunnel VNC server (mTLS)
+  copy:
+    dest: /etc/stunnel/vnc.conf
+    mode: "0644"
+    content: |
+      pid = /var/run/stunnel-vnc.pid
+      foreground = no
+      output = /var/log/stunnel-vnc.log
+      cert = /etc/stunnel/server.pem
+      key  = /etc/stunnel/server.key
+      CAfile = /etc/stunnel/server.pem
+      verify = 2
+      [vnc]
+      accept  = {{ vnc_stunnel_port }}
+      connect = 127.0.0.1:{{ vnc_rfb_port }}
+  notify: Restart stunnel
+  tags: stunnel
+
+- name: Enable and start stunnel4
+  systemd: {name: stunnel4, enabled: yes, state: started, daemon_reload: yes}
+  tags: stunnel
+
+# ── Firefox profile + GWR-only login (tag: firefox) ────────────────────────
+- name: Mint a Firefox profile (headless launch, then quit)
+  # kill by PID, never `pkill -f firefox` — that pattern matches this very shell
+  # command line and would kill its own shell (non-zero exit).
+  shell: |
+    nohup firefox-esr about:blank >/tmp/ffmint.log 2>&1 &
+    ffpid=$!
+    sleep 15
+    kill "$ffpid" 2>/dev/null || true
+    sleep 3
+  args: { executable: /bin/bash }
+  become: true
+  become_user: "{{ browser_user }}"
+  environment:
+    DISPLAY: ":{{ vnc_display }}"
+    XAUTHORITY: "{{ browser_home }}/.Xauthority"
+  changed_when: false
+  tags: firefox
+
+- name: Discover the Firefox profile directory
+  shell: "ls -d {{ browser_home }}/.mozilla/firefox/*.default-esr 2>/dev/null | head -1"
+  register: ff_profile
+  changed_when: false
+  tags: firefox
+
+- name: Inject GWR-only login (key4.db + filtered logins.json)
+  copy:
+    src: "{{ gwr_secrets_dir }}/{{ item }}"
+    dest: "{{ ff_profile.stdout }}/{{ item }}"
+    owner: "{{ browser_user }}"
+    group: "{{ browser_user }}"
+    mode: "0600"
+  loop:
+    - key4.db
+    - logins.json
+  when: gwr_secrets_dir | length > 0 and ff_profile.stdout | length > 0
+  tags: firefox
+
+- name: Launch Firefox on the target site
+  shell: 'nohup firefox-esr "{{ start_url }}" >/tmp/ff.log 2>&1 & sleep 3'
+  args: { executable: /bin/bash }
+  become: true
+  become_user: "{{ browser_user }}"
+  environment:
+    DISPLAY: ":{{ vnc_display }}"
+    XAUTHORITY: "{{ browser_home }}/.Xauthority"
+  changed_when: false
+  tags: firefox

@@ -1,0 +1,219 @@
+---
+# End-to-end: launch an EC2 host and configure it as a GWR browser host.
+# Imperative bits (EC2 launch, Firefox profile) are scripts/shell CALLED FROM
+# Ansible; everything idempotent is proper modules + the browser_host role.
+#
+#   cd ~/git/ansible
+#   ansible-playbook provision_browser_host.yml -e host_name=enoki
+#
+# Then start the tunnel from kelp and drive:
+#   ssh -N -L 5902:localhost:5901 <host_name>
+
+- name: Launch and register the browser host
+  hosts: localhost
+  gather_facts: no
+  environment:
+    AWS_PROFILE: "{{ aws_profile | default('provision') }}"
+  vars:
+    name: "{{ host_name | default('enoki') }}"
+    region: "{{ host_region | default('eu-central-1') }}"
+    instance_type: "{{ host_type | default('t4g.large') }}"
+    ami: "{{ host_ami | default('ami-08241d277446b81d7') }}"
+    pem: "/home/john/.ssh/{{ name }}.pem"
+    known_hosts_files:
+      - /home/john/.ssh/known_hosts
+      - /home/admin/.ssh/known_hosts
+
+  tasks:
+    - name: Launch instance via awslaunch.py
+      command: >
+        /home/john/aws/awslaunch.py {{ name }} {{ instance_type }}
+        --region {{ region }} --ami {{ ami }}
+      register: launch
+
+    - name: "Parse the Hosts line from awslaunch"
+      set_fact:
+        _hl: "{{ launch.stdout_lines | select('match', '^Hosts:') | first | regex_replace('^Hosts: ', '') }}"
+    - set_fact:
+        host_ip: "{{ _hl.split()[0] }}"
+        instance_id: "{{ _hl.split()[3] }}"
+
+    - name: Point /etc/hosts at the new instance
+      lineinfile:
+        path: /etc/hosts
+        regexp: "\\s{{ name }}\\s"
+        line: "{{ host_ip }} {{ name }} {{ name }}.critchley.biz"
+      become: yes
+
+    - name: Wait for SSH
+      wait_for:
+        host: "{{ host_ip }}"
+        port: 22
+        delay: 5
+        timeout: 240
+
+    - name: Read the instance host key
+      command: "ssh-keyscan -t ed25519 {{ host_ip }}"
+      register: hk
+      changed_when: false
+      retries: 5
+      delay: 5
+      until: hk.stdout | length > 0
+
+    - name: Extract key material (keytype + data)
+      # ssh-keyscan emits a "# host SSH-2.0-..." banner line too; pick the real
+      # key line (the one with the keytype), not stdout_lines[0].
+      set_fact:
+        hostkey_data: "{{ (hk.stdout_lines | reject('match', '^#') | select('search', 'ssh-ed25519') | first).split(' ')[1:] | join(' ') }}"
+
+    # The known_hosts MODULE mishandles files that already contain hashed entries;
+    # ssh-keygen -R + append is more robust here — a script bit, called from Ansible.
+    - name: Trust the host key (both dual-uid files, all aliases)
+      shell: |
+        for f in {{ known_hosts_files | join(' ') }}; do
+          touch "$f"; chmod 600 "$f"
+          for h in {{ name }} {{ name }}.critchley.biz {{ host_ip }}; do
+            ssh-keygen -R "$h" -f "$f" >/dev/null 2>&1 || true
+            echo "$h {{ hostkey_data }}" >> "$f"
+          done
+        done
+      changed_when: true
+
+    - name: Write ~/later/instance.env for teardown
+      copy:
+        dest: /home/john/later/instance.env
+        mode: "0644"
+        content: |
+          # State for the later/ cleanup scripts. Provisioned {{ ansible_date_time.date | default('') }}.
+          INSTANCE_ID={{ instance_id }}
+          NAME={{ name }}
+          PUBLIC_DNS={{ host_ip }}
+          PUBLIC_IP={{ host_ip }}
+          REGION={{ region }}
+          BROWSER_HOST_USER=admin
+
+    - name: Add the new host to the in-memory inventory
+      add_host:
+        name: "{{ name }}"
+        ansible_host: "{{ host_ip }}"
+        ansible_user: admin
+        ansible_ssh_private_key_file: "{{ pem }}"
+        ansible_ssh_common_args: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+        groups: browser_new
+
+- name: Configure the browser host
+  hosts: browser_new
+  gather_facts: yes
+  become: yes
+
+  pre_tasks:
+    - name: Set hostname
+      hostname:
+        name: "{{ inventory_hostname }}"
+
+    - name: Look up admin uid/gid
+      getent:
+        database: passwd
+        key: admin
+    - set_fact:
+        admin_uid: "{{ getent_passwd['admin'][1] }}"
+        admin_gid: "{{ getent_passwd['admin'][2] }}"
+
+    - name: Create john user sharing admin's uid (dual-uid pattern)
+      user:
+        name: john
+        uid: "{{ admin_uid }}"
+        group: "{{ admin_gid }}"
+        home: /home/john
+        shell: /bin/bash
+        create_home: yes
+        non_unique: yes
+
+    - name: Authorise John's + admin's keys for both admin and john
+      authorized_key:
+        user: "{{ item.0 }}"
+        key: "{{ lookup('file', item.1) }}"
+        state: present
+      loop: "{{ ['admin', 'john'] | product(['/home/admin/.ssh/id_ed25519.pub', '/home/john/.ssh/id_ed25519.pub']) | list }}"
+
+  roles:
+    - browser_host
+
+  post_tasks:
+    - name: List the viewer certs the host issued
+      find:
+        paths: /etc/stunnel/clients
+        patterns: "*.crt"
+      register: viewer_certs
+
+    - name: Fetch the host CA cert + all viewer certs back to the controller
+      fetch:
+        src: "{{ item }}"
+        dest: "/home/john/aws/host-certs/{{ inventory_hostname_short }}/"
+        flat: yes
+      loop: "{{ ['/etc/stunnel/server.pem'] + (viewer_certs.files | map(attribute='path') | list) }}"
+
+
+- name: Publish viewer certs and wire up kelp's stunnel client
+  hosts: localhost
+  gather_facts: no
+  vars:
+    name: "{{ host_name | default('enoki') }}"
+    certdir: "/home/john/aws/host-certs/{{ host_name | default('enoki') }}"
+    webdav_dir: "delayrepay/certs/{{ host_name | default('enoki') }}"
+    stunnel_port: 15901
+  tasks:
+    - name: Ensure kelp stunnel dir
+      file: {path: /home/john/aws/stunnel, state: directory, mode: "0755"}
+
+    - name: Write kelp's stunnel client config (VNC over mTLS -> localhost:5902)
+      copy:
+        dest: /home/john/aws/stunnel/vnc-client.conf
+        mode: "0644"
+        content: |
+          pid = /home/john/aws/stunnel/vnc-client.pid
+          foreground = no
+          output = /home/john/aws/stunnel/vnc-client.log
+          client = yes
+          CAfile = {{ certdir }}/server.pem
+          cert = {{ certdir }}/kelp.crt
+          key  = /home/john/aws/viewer-keys/kelp.key
+          verify = 2
+          checkHost = {{ name }}.critchley.biz
+          [vnc]
+          accept  = 127.0.0.1:5902
+          connect = {{ host_ip }}:{{ stunnel_port }}
+
+    - name: Create the WebDAV cert collection (each parent level in turn)
+      # MKCOL creates only ONE level, so 'delayrepay/certs/<host>/' 404s unless
+      # 'delayrepay/' and 'delayrepay/certs/' already exist. Make each in order.
+      command: 'curl -n -sS -X MKCOL "https://webdav.critchley.biz/{{ item }}/"'
+      loop:
+        - delayrepay
+        - delayrepay/certs
+        - "{{ webdav_dir }}"
+      changed_when: false
+      failed_when: false
+
+    - name: Publish the CA + non-kelp viewer certs to WebDAV (client download)
+      command: >
+        curl -n -sS -o /dev/null -w "%{http_code}"
+        -T "{{ item }}" "https://webdav.critchley.biz/{{ webdav_dir }}/{{ item | basename }}"
+      loop: "{{ [certdir + '/server.pem'] +
+                (query('fileglob', certdir + '/*.crt') | reject('search', '/kelp.crt') | list) }}"
+      changed_when: true
+
+    - name: Publish the current host's connection info to WebDAV
+      copy:
+        dest: /home/john/aws/stunnel/current-host.env
+        content: |
+          HOST={{ name }}
+          IP={{ host_ip }}
+          CN={{ name }}.critchley.biz
+          PORT={{ stunnel_port }}
+    - name: Upload current-host.env
+      command: >
+        curl -n -sS -o /dev/null -w "%{http_code}"
+        -T /home/john/aws/stunnel/current-host.env
+        "https://webdav.critchley.biz/delayrepay/current-host.env"
+      changed_when: true

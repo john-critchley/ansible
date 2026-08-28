@@ -1,0 +1,18 @@
+---
+# browser_host role — Firefox + TigerVNC(:1) + XFCE, driven over VNC.
+browser_user: admin
+browser_home: "/home/{{ browser_user }}"
+vnc_display: "1"
+vnc_geometry: "1920x1080"
+vnc_depth: "24"
+
+# GWR-only Firefox login bundle on the CONTROLLER (filtered logins.json + key4.db).
+# Set gwr_secrets_dir to '' to skip credential injection.
+gwr_secrets_dir: "/home/john/aws/browser-secrets"
+start_url: "https://delayrepay.gwr.com/"
+
+# stunnel: the host is its own CA; it signs the registered viewer CSRs so each
+# client (kelp/Mac/pomelo) gets a per-host cert. mTLS on vnc_stunnel_port.
+vnc_rfb_port: 5901
+vnc_stunnel_port: 15901
+viewer_csr_dir: "/home/john/aws/viewer-csrs"   # registered client CSRs (on the controller)
