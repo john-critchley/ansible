@@ -4,4 +4,9 @@ unset SESSION_MANAGER
 unset DBUS_SESSION_BUS_ADDRESS
 export XDG_SESSION_TYPE=x11
 [ -r "$HOME/.Xresources" ] && xrdb "$HOME/.Xresources"
+# Disable the X screen saver / blanking. The XFCE screensaver only blanks and
+# never locks (known issue on this headless VNC display), so it's pointless —
+# xfce4-screensaver itself is kept from autostarting via the autostart override
+# deployed by setup_browser_host.yml. (DPMS extension is absent under Xvnc.)
+xset s off
 exec dbus-launch --exit-with-session startxfce4
