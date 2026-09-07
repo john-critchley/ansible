@@ -43,29 +43,6 @@
     mode: "0755"
   tags: vnc
 
-- name: Ensure ~/.config/autostart exists
-  file:
-    path: "{{ browser_home }}/.config/autostart"
-    state: directory
-    owner: "{{ browser_user }}"
-    group: "{{ browser_user }}"
-    mode: "0755"
-  tags: vnc
-
-- name: Disable XFCE screensaver autostart (blanks but never locks — pointless here)
-  copy:
-    dest: "{{ browser_home }}/.config/autostart/xfce4-screensaver.desktop"
-    owner: "{{ browser_user }}"
-    group: "{{ browser_user }}"
-    mode: "0644"
-    content: |
-      [Desktop Entry]
-      Type=Application
-      Name=Screensaver
-      Comment=Overrides /etc/xdg/autostart to keep xfce4-screensaver from starting.
-      Hidden=true
-  tags: vnc
-
 - name: Deploy per-user VNC config (localhost-only, no auth)
   copy:
     dest: "{{ browser_home }}/.vnc/config"
