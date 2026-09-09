@@ -22,7 +22,10 @@
     update_cache: yes
   tags: packages
 
-- name: Ensure ~/.vnc and ~/bin exist
+- name: Ensure ~/.vnc, ~/bin, and ~/.config|~/.cache exist
+  # ~/.config and ~/.cache MUST exist before tigervnc starts: on a first boot
+  # they are absent, and tigervnc's session dies mid-migration (the "VNC dies on
+  # first boot" failure). Creating them up front removes the race.
   file:
     path: "{{ item }}"
     state: directory
@@ -32,6 +35,8 @@
   loop:
     - "{{ browser_home }}/.vnc"
     - "{{ browser_home }}/bin"
+    - "{{ browser_home }}/.config"
+    - "{{ browser_home }}/.cache"
   tags: vnc
 
 - name: Deploy VNC xstartup (XFCE session)
@@ -63,6 +68,20 @@
     regexp: "^:{{ vnc_display }}="
     line: ":{{ vnc_display }}={{ browser_user }}"
     mode: "0644"
+  tags: vnc
+
+- name: Drop-in dir for the tigervnc unit override
+  file: {path: /etc/systemd/system/tigervncserver@.service.d, state: directory, mode: "0755"}
+  tags: vnc
+
+- name: Auto-restart the VNC server if it dies (first-boot safety net)
+  copy:
+    dest: /etc/systemd/system/tigervncserver@.service.d/override.conf
+    mode: "0644"
+    content: |
+      [Service]
+      Restart=on-failure
+      RestartSec=3
   tags: vnc
 
 - name: Enable and start tigervncserver@:{{ vnc_display }}
@@ -150,13 +169,17 @@
 
 # ── Firefox profile + GWR-only login (tag: firefox) ────────────────────────
 - name: Mint a Firefox profile (headless launch, then quit)
-  # kill by PID, never `pkill -f firefox` — that pattern matches this very shell
-  # command line and would kill its own shell (non-zero exit).
+  # After minting, kill EVERY firefox — not just the launcher PID. Firefox forks
+  # children, and any lingering process REWRITES logins.json on exit, clobbering
+  # the login we inject in the next task (the autofill-fails bug, 2026-09-09).
+  # '[f]irefox' matches the real processes without pkill matching its own argv
+  # (a plain `pkill -f firefox` would kill this very shell).
   shell: |
     nohup firefox-esr about:blank >/tmp/ffmint.log 2>&1 &
     ffpid=$!
     sleep 15
     kill "$ffpid" 2>/dev/null || true
+    pkill -f '[f]irefox' 2>/dev/null || true
     sleep 3
   args: { executable: /bin/bash }
   become: true
@@ -173,6 +196,14 @@
   changed_when: false
   tags: firefox
 
+- name: Fail early if no Firefox profile was minted
+  # Silent failure here = the GWR login is injected nowhere and autofill never
+  # works. Surface it loudly instead.
+  assert:
+    that: ff_profile.stdout | length > 0
+    fail_msg: "No *.default-esr profile under {{ browser_home }}/.mozilla/firefox after mint."
+  tags: firefox
+
 - name: Inject GWR-only login (key4.db + filtered logins.json)
   copy:
     src: "{{ gwr_secrets_dir }}/{{ item }}"
@@ -186,8 +217,11 @@
   when: gwr_secrets_dir | length > 0 and ff_profile.stdout | length > 0
   tags: firefox
 
-- name: Launch Firefox on the target site
-  shell: 'nohup firefox-esr "{{ start_url }}" >/tmp/ff.log 2>&1 & sleep 3'
+- name: Launch Firefox on the target site (pinned to the injected profile)
+  # --profile pins the exact profile we injected into, so autofill can't miss it
+  # by launching a different auto-selected profile (belt-and-braces alongside the
+  # reliable-kill fix above).
+  shell: 'nohup firefox-esr --profile "{{ ff_profile.stdout }}" "{{ start_url }}" >/tmp/ff.log 2>&1 & sleep 3'
   args: { executable: /bin/bash }
   become: true
   become_user: "{{ browser_user }}"
