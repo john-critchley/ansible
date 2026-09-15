@@ -10,6 +10,9 @@ vnc_depth: "24"
 # Set gwr_secrets_dir to '' to skip credential injection.
 gwr_secrets_dir: "/home/john/aws/browser-secrets"
 start_url: "https://delayrepay.gwr.com/"
+# Dedicated Firefox profile, created with -CreateProfile (no browsing session),
+# then the login bundle is injected into it and Firefox is launched pinned to it.
+ff_profile_dir: "{{ browser_home }}/.mozilla/firefox/gwr"
 
 # stunnel: the host is its own CA; it signs the registered viewer CSRs so each
 # client (kelp/Mac/pomelo) gets a per-host cert. mTLS on vnc_stunnel_port.
