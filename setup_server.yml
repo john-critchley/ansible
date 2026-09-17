@@ -18,7 +18,7 @@
 - name: Set up application server
   hosts: "{{ target }}"
   become: yes
-  gather_facts: yes
+  gather_facts: false
   vars:
     socks5_port: 1080
     socks5_listen: "127.0.0.1"
@@ -31,6 +31,14 @@
     gdata_server_dest: /home/john/py/gdata-server
     aws_open_port_path: /home/john/aws/aws_open_port.py
     region: "{{ aws_region | default('eu-north-1') }}"
+
+  pre_tasks:
+    - ansible.builtin.import_tasks: tasks/audit_system_ownership.yml
+      tags: always
+
+    - name: Gather facts after ownership audit
+      ansible.builtin.setup:
+      tags: always
 
   tasks:
 
@@ -392,6 +400,11 @@
       notify: Restart apache
       tags: apache
 
+    - name: Manage Apache worker capacity and diagnostics
+      ansible.builtin.import_role:
+        name: apache_capacity
+      tags: [apache, apache_capacity]
+
     - name: Disable default Apache site
       command: a2dissite 000-default
       args:
@@ -509,31 +522,31 @@
       meta: flush_handlers
       tags: [apache, certs]
 
-    - name: Obtain Let's Encrypt certificate for www.critchley.biz
+    # ONE multi-SAN certificate covering all three 443 vhosts, not three
+    # single-name certificates.
+    #
+    # Why: TLS picks the certificate before the Host: header arrives, so a
+    # client that does not send SNI always gets the DEFAULT vhost's cert. The
+    # 2009 Mac mini's curl 7.43 does not send SNI, so it received cv's cert
+    # for every request and Apache answered HTTP 421 Misdirected Request on
+    # webdav and www. A single cert naming all three means the default vhost's
+    # cert is valid for whatever the client actually asked for, so the
+    # no-SNI case works. Changed 2026-09-16; see notes hosts/gravlax.
+    #
+    # --cert-name pins the lineage directory to /etc/letsencrypt/live/
+    # critchley-multi/ regardless of which -d comes first; without it certbot
+    # names the directory after the first domain and the vhosts below break.
+    # --expand lets the domain list grow later without a new lineage.
+    - name: Obtain one Let's Encrypt multi-SAN certificate for all 443 vhosts
       command: >
-        certbot certonly --webroot -w /var/www/www.critchley.biz
-        -d www.critchley.biz
-        --non-interactive --agree-tos -m john@critchley.biz
+        certbot certonly --webroot
+        --cert-name critchley-multi
+        -w /var/www/www.critchley.biz -d www.critchley.biz
+        -w /var/www/cv.critchley.biz -d cv.critchley.biz
+        -w /var/www/webdav -d webdav.critchley.biz
+        --expand --non-interactive --agree-tos -m john@critchley.biz
       args:
-        creates: /etc/letsencrypt/live/www.critchley.biz/fullchain.pem
-      tags: [apache, certs]
-
-    - name: Obtain Let's Encrypt certificate for cv.critchley.biz
-      command: >
-        certbot certonly --webroot -w /var/www/cv.critchley.biz
-        -d cv.critchley.biz
-        --non-interactive --agree-tos -m john@critchley.biz
-      args:
-        creates: /etc/letsencrypt/live/cv.critchley.biz/fullchain.pem
-      tags: [apache, certs]
-
-    - name: Obtain Let's Encrypt certificate for webdav.critchley.biz
-      command: >
-        certbot certonly --webroot -w /var/www/webdav
-        -d webdav.critchley.biz
-        --non-interactive --agree-tos -m john@critchley.biz
-      args:
-        creates: /etc/letsencrypt/live/webdav.critchley.biz/fullchain.pem
+        creates: /etc/letsencrypt/live/critchley-multi/fullchain.pem
       tags: [apache, certs]
 
     - name: Deploy HTTPS vhost configs
@@ -593,6 +606,28 @@
       delegate_to: localhost
       become: no
       tags: [mcp, ports]
+
+    # ── patched at (with -e/--cmd support) ───────────────────────────────────
+
+    - name: Deploy patched at binary
+      copy:
+        src: "at/at-{{ 'arm64' if ansible_architecture == 'aarch64' else 'amd64' }}"
+        dest: /usr/local/bin/at
+        owner: root
+        group: daemon
+        mode: '6755'
+      tags: at
+
+    - name: Symlink atq and atrm to at
+      file:
+        src: /usr/local/bin/at
+        dest: "/usr/local/bin/{{ item }}"
+        state: link
+        force: yes
+      loop:
+        - atq
+        - atrm
+      tags: at
 
   handlers:
     - name: Restart microsocks
