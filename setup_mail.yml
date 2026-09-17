@@ -1,0 +1,311 @@
+---
+# Set up Dovecot IMAP + LMTP mail server on gravlax.
+#
+# Users: john, envoy, hermes (virtual, passwd-file auth)
+# Delivery: WebDAV writes directly to Maildir as www-data; Dovecot serves as www-data
+# TLS: Let's Encrypt via Apache webroot
+#
+# Mail storage runs as www-data (uid 33) so WebDAV delivery and Dovecot share
+# the same uid — no separate vmail user needed.
+#
+# Usage:
+#   ansible-playbook setup_mail.yml -e "target=gravlax" -e @secrets.yml
+#
+# secrets.yml must contain plaintext passwords (hashed by playbook):
+#   mail_pw_john:   "plaintext"
+#   mail_pw_envoy:  "plaintext"
+#   mail_pw_hermes: "plaintext"
+#
+# Tags:
+#   install  — apt packages
+#   maildir  — mail directories
+#   config   — Dovecot configuration files
+#   users    — virtual users passwd file
+#   certs    — Let's Encrypt certificate
+#   ports    — AWS security group ports 80, 993
+
+- name: Set up Dovecot mail server
+  hosts: "{{ target }}"
+  become: yes
+  gather_facts: yes
+  vars:
+    mail_fqdn: mail.critchley.biz
+    mail_base_dir: /var/mail/vhosts
+    mail_user: www-data
+    mail_group: www-data
+    dovecot_users_file: /etc/dovecot/users
+    acme_webroot: /var/www/acme
+    aws_open_port_path: /home/john/aws/aws_open_port.py
+    region: "{{ aws_region | default('eu-north-1') }}"
+    mail_users:
+      - { name: john,   pw: "{{ mail_pw_john }}" }
+      - { name: envoy,  pw: "{{ mail_pw_envoy }}" }
+      - { name: hermes, pw: "{{ mail_pw_hermes }}" }
+
+  tasks:
+
+    # ── Packages ──────────────────────────────────────────────────────────────
+
+    - name: Install Dovecot and certbot
+      apt:
+        name:
+          - dovecot-core
+          - dovecot-imapd
+          - dovecot-lmtpd
+          - certbot
+          - python3-certbot-apache
+        state: present
+        update_cache: yes
+      tags: [install]
+
+    # ── Mail directories (owned by www-data) ──────────────────────────────────
+
+    - name: Create mail base directory
+      file:
+        path: "{{ mail_base_dir }}"
+        state: directory
+        owner: "{{ mail_user }}"
+        group: "{{ mail_group }}"
+        mode: '0750'
+      tags: [maildir]
+
+    - name: Create per-user mailbox directories
+      file:
+        path: "{{ mail_base_dir }}/{{ item.name }}"
+        state: directory
+        owner: "{{ mail_user }}"
+        group: "{{ mail_group }}"
+        mode: '0700'
+      loop: "{{ mail_users }}"
+      tags: [maildir]
+
+    # ── Dovecot configuration ─────────────────────────────────────────────────
+
+    - name: Dovecot main config
+      copy:
+        dest: /etc/dovecot/dovecot.conf
+        content: |
+          protocols = imap lmtp
+          listen = *
+          !include conf.d/*.conf
+          !include_try local.conf
+        owner: root
+        group: dovecot
+        mode: '0644'
+      notify: Restart Dovecot
+      tags: [config]
+
+    - name: Dovecot mail location
+      copy:
+        dest: /etc/dovecot/conf.d/10-mail.conf
+        content: |
+          mail_location = maildir:{{ mail_base_dir }}/%u
+          mail_uid = {{ mail_user }}
+          mail_gid = {{ mail_group }}
+          mail_privileged_group = {{ mail_group }}
+          first_valid_uid = 33
+
+          namespace inbox {
+            inbox = yes
+          }
+        owner: root
+        group: dovecot
+        mode: '0644'
+      notify: Restart Dovecot
+      tags: [config]
+
+    - name: Dovecot auth config
+      copy:
+        dest: /etc/dovecot/conf.d/10-auth.conf
+        content: |
+          disable_plaintext_auth = yes
+          auth_mechanisms = plain login
+          !include auth-passwdfile.conf.ext
+        owner: root
+        group: dovecot
+        mode: '0644'
+      notify: Restart Dovecot
+      tags: [config]
+
+    - name: Dovecot passwd-file auth backend
+      copy:
+        dest: /etc/dovecot/conf.d/auth-passwdfile.conf.ext
+        content: |
+          passdb {
+            driver = passwd-file
+            args = scheme=SHA512-CRYPT {{ dovecot_users_file }}
+          }
+          userdb {
+            driver = static
+            args = uid={{ mail_user }} gid={{ mail_group }} home={{ mail_base_dir }}/%u
+          }
+        owner: root
+        group: dovecot
+        mode: '0644'
+      notify: Restart Dovecot
+      tags: [config]
+
+    - name: Dovecot service listeners (IMAP + LMTP)
+      copy:
+        dest: /etc/dovecot/conf.d/10-master.conf
+        content: |
+          service imap-login {
+            inet_listener imap {
+              port = 0
+            }
+            inet_listener imaps {
+              port = 993
+              ssl = yes
+            }
+          }
+
+          service lmtp {
+            unix_listener lmtp {
+              path = /var/run/dovecot/lmtp
+              mode = 0660
+              user = {{ mail_user }}
+              group = {{ mail_group }}
+            }
+          }
+
+          service auth {
+            unix_listener auth-userdb {
+              mode = 0600
+              user = {{ mail_user }}
+            }
+          }
+        owner: root
+        group: dovecot
+        mode: '0644'
+      notify: Restart Dovecot
+      tags: [config]
+
+    - name: Dovecot TLS config
+      copy:
+        dest: /etc/dovecot/conf.d/10-ssl.conf
+        content: |
+          ssl = required
+          ssl_cert = </etc/letsencrypt/live/{{ mail_fqdn }}/fullchain.pem
+          ssl_key  = </etc/letsencrypt/live/{{ mail_fqdn }}/privkey.pem
+          ssl_min_protocol = TLSv1.2
+          ssl_cipher_list = ECDHE+AESGCM:DHE+AESGCM
+          ssl_prefer_server_ciphers = yes
+        owner: root
+        group: dovecot
+        mode: '0644'
+      notify: Restart Dovecot
+      tags: [config, certs]
+
+    # ── Virtual users ─────────────────────────────────────────────────────────
+
+    - name: Write Dovecot users file
+      copy:
+        dest: "{{ dovecot_users_file }}"
+        content: |
+          {% for u in mail_users %}
+          {{ u.name }}:{{ u.pw | password_hash('sha512') }}
+          {% endfor %}
+        owner: root
+        group: dovecot
+        mode: '0640'
+      no_log: true
+      notify: Restart Dovecot
+      tags: [users]
+
+    # ── TLS certificate ───────────────────────────────────────────────────────
+
+    - name: Create ACME webroot directory
+      file:
+        path: "{{ acme_webroot }}"
+        state: directory
+        owner: www-data
+        group: www-data
+        mode: '0755'
+      tags: [certs]
+
+    - name: Apache vhost for ACME challenge (HTTP only)
+      copy:
+        dest: /etc/apache2/sites-available/acme.conf
+        content: |
+          <VirtualHost *:80>
+              ServerName {{ mail_fqdn }}
+              DocumentRoot {{ acme_webroot }}
+              <Directory {{ acme_webroot }}>
+                  Options None
+                  AllowOverride None
+                  Require all granted
+              </Directory>
+          </VirtualHost>
+      notify: Reload Apache
+      tags: [certs]
+
+    - name: Enable ACME vhost
+      command: a2ensite acme.conf
+      args:
+        creates: /etc/apache2/sites-enabled/acme.conf
+      notify: Reload Apache
+      tags: [certs]
+
+    - name: Flush handlers so Apache is ready for certbot
+      meta: flush_handlers
+      tags: [certs]
+
+    - name: Open port 80 for certbot ACME challenge
+      command: >
+        python3 {{ aws_open_port_path }}
+        {{ inventory_hostname }} 80 0.0.0.0/0
+        --region {{ region }}
+      delegate_to: localhost
+      become: no
+      tags: [certs, ports]
+
+    - name: Obtain Let's Encrypt certificate
+      command: >
+        certbot certonly --webroot
+        -w {{ acme_webroot }}
+        -d {{ mail_fqdn }}
+        --non-interactive --agree-tos
+        -m john@critchley.biz
+      args:
+        creates: /etc/letsencrypt/live/{{ mail_fqdn }}/fullchain.pem
+      tags: [certs]
+
+    - name: Certbot renewal hook — reload Dovecot on cert renewal
+      copy:
+        dest: /etc/letsencrypt/renewal-hooks/deploy/dovecot-reload
+        content: |
+          #!/bin/sh
+          systemctl reload dovecot
+        mode: '0755'
+      tags: [certs]
+
+    # ── AWS security group ────────────────────────────────────────────────────
+
+    - name: Open port 993 (IMAPS)
+      command: >
+        python3 {{ aws_open_port_path }}
+        {{ inventory_hostname }} 993 0.0.0.0/0
+        --region {{ region }}
+      delegate_to: localhost
+      become: no
+      tags: [ports]
+
+    # ── Service ───────────────────────────────────────────────────────────────
+
+    - name: Enable and start Dovecot
+      systemd:
+        name: dovecot
+        enabled: yes
+        state: started
+      tags: [config]
+
+  handlers:
+    - name: Restart Dovecot
+      systemd:
+        name: dovecot
+        state: restarted
+
+    - name: Reload Apache
+      systemd:
+        name: apache2
+        state: reloaded

@@ -17,9 +17,10 @@
 # If the asserter JARs cannot be downloaded, the playbook falls back to building
 # from source via Maven (slower, but always works).
 #
-# Remote Console access (no extra ports needed):
-#   ssh -L 7001:localhost:7001 -L 7002:localhost:7002 <target>
-#   Then point Remote Console at http://localhost:7001
+# Remote Console access:
+#   Port 7001 is opened to the controller IP by this playbook (aws tag).
+#   Connect Remote Console directly to http://<target>:7001 from the controller.
+#   No SSH tunnel needed.
 #
 # Built-in help:
 #   ansible-playbook deploy_weblogic_ldap.yml -e "help=yes"
