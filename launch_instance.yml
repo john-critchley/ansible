@@ -3,6 +3,8 @@
 # Usage: ansible-playbook launch_instance.yml -e "name=myhost region=us-east-1"
 #    or: ansible-playbook launch_instance.yml -e "instance_name=myhost region=eu-central-1"
 # Optional: -e "instance_type=t3.medium ami=<region-specific-ami> spot=yes remove_sudo=yes aliases='weblogicserver foo'"
+# Tags (second play):
+#   swap      — 2×RAM EBS swap volume (gp3, delete-on-termination)
 
 - name: Launch EC2 instance and update local hosts
   hosts: localhost
@@ -150,7 +152,7 @@
 
 - name: Configure the new instance
   hosts: "{{ target | default('new_instance') }}"
-  gather_facts: yes
+  gather_facts: false
   become: yes
   vars:
     ssh_pubkey_path: /home/john/.ssh/id_ed25519.pub
@@ -158,6 +160,14 @@
     remove_sudo_raw: "{{ remove_sudo | default('no') }}"
     remove_sudo_bool: "{{ remove_sudo_raw | lower in ['yes', 'true', '1'] }}"
     instance_name: "{{ launch_instance_name | default(inventory_hostname) }}"
+
+  pre_tasks:
+    - ansible.builtin.import_tasks: tasks/audit_system_ownership.yml
+      tags: always
+
+    - name: Gather facts after ownership audit
+      ansible.builtin.setup:
+      tags: always
 
   tasks:
     - name: Read local SSH public key
@@ -296,6 +306,120 @@
 #        owner: john
 #        group: "{{ admin_gid }}"
 #        mode: '0644'
+
+    # ── swap (2×RAM on a dedicated EBS volume) ────────────────────────────────
+
+    - name: Check if swap already active or configured
+      shell: swapon --show | grep -q . || grep -q 'LABEL=SWAP' /etc/fstab
+      register: swap_exists
+      failed_when: false
+      changed_when: false
+      tags: swap
+
+    - name: Fetch EC2 instance ID from metadata service
+      shell: curl -sf http://169.254.169.254/latest/meta-data/instance-id
+      register: ec2_instance_id_raw
+      changed_when: false
+      when: swap_exists.rc != 0
+      tags: swap
+
+    - name: Fetch EC2 availability zone from metadata service
+      shell: curl -sf http://169.254.169.254/latest/meta-data/placement/availability-zone
+      register: ec2_az_raw
+      changed_when: false
+      when: swap_exists.rc != 0
+      tags: swap
+
+    - name: Set EC2 identity facts
+      set_fact:
+        ec2_instance_id: "{{ ec2_instance_id_raw.stdout | trim }}"
+        ec2_az: "{{ ec2_az_raw.stdout | trim }}"
+        ec2_region: "{{ ec2_az_raw.stdout | trim | regex_replace('[a-z]$', '') }}"
+      when: swap_exists.rc != 0
+      tags: swap
+
+    - name: Set swap volume size (2×RAM GiB, minimum 1)
+      set_fact:
+        swap_gib: "{{ [((ansible_memtotal_mb * 2) / 1024) | round(0, 'ceil') | int, 1] | max }}"
+      when: swap_exists.rc != 0
+      tags: swap
+
+    - name: Create swap EBS volume
+      command: >
+        aws ec2 create-volume
+        --availability-zone {{ ec2_az }}
+        --size {{ swap_gib }}
+        --volume-type gp3
+        --region {{ ec2_region }}
+        --query VolumeId --output text
+      register: swap_vol_id
+      delegate_to: localhost
+      become: no
+      when: swap_exists.rc != 0
+      tags: swap
+
+    - name: Wait for swap volume to become available
+      command: >
+        aws ec2 wait volume-available
+        --volume-ids {{ swap_vol_id.stdout | trim }}
+        --region {{ ec2_region }}
+      delegate_to: localhost
+      become: no
+      when: swap_exists.rc != 0
+      tags: swap
+
+    - name: Attach swap volume to instance
+      command: >
+        aws ec2 attach-volume
+        --instance-id {{ ec2_instance_id }}
+        --volume-id {{ swap_vol_id.stdout | trim }}
+        --device /dev/sdf
+        --region {{ ec2_region }}
+      delegate_to: localhost
+      become: no
+      when: swap_exists.rc != 0
+      tags: swap
+
+    - name: Mark swap volume delete-on-termination
+      command: >
+        aws ec2 modify-instance-attribute
+        --instance-id {{ ec2_instance_id }}
+        --block-device-mappings '[{"DeviceName":"/dev/sdf","Ebs":{"DeleteOnTermination":true}}]'
+        --region {{ ec2_region }}
+      delegate_to: localhost
+      become: no
+      when: swap_exists.rc != 0
+      tags: swap
+
+    - name: Wait for swap block device to appear
+      shell: |
+        for i in $(seq 1 30); do
+          for dev in /dev/nvme1n1 /dev/xvdf /dev/sdf; do
+            [ -b "$dev" ] && echo "$dev" && exit 0
+          done
+          sleep 2
+        done
+        exit 1
+      register: swap_dev
+      when: swap_exists.rc != 0
+      tags: swap
+
+    - name: Format swap device
+      command: mkswap -L SWAP {{ swap_dev.stdout | trim }}
+      when: swap_exists.rc != 0
+      tags: swap
+
+    - name: Activate swap
+      command: swapon LABEL=SWAP
+      when: swap_exists.rc != 0
+      tags: swap
+
+    - name: Add swap to /etc/fstab
+      lineinfile:
+        path: /etc/fstab
+        line: "LABEL=SWAP none swap sw 0 0"
+        state: present
+      tags: swap
 
     # ── skeleton ──────────────────────────────────────────────────────────────
 
