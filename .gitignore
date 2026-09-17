@@ -32,3 +32,11 @@ __pycache__/
 
 # Scratch/temp working files
 tmp/
+
+# Agent/session artefacts (added 2026-09-17)
+.claude/
+transcript.en.vtt
+
+# Superseded by the browser_host role on the browser-host branch
+setup_browser_host_enhanced.yml
+setup_browser_host.yml.backup
