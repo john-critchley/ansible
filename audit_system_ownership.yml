@@ -1,0 +1,7 @@
+---
+# Read-only; does not need working sudo. Set target explicitly for other hosts.
+- name: Audit critical ownership before attempting privileged operations
+  hosts: "{{ target | default('kelp:gravlax') }}"
+  gather_facts: false
+  tasks:
+    - ansible.builtin.import_tasks: tasks/audit_system_ownership.yml
