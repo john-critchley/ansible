@@ -1,0 +1,12 @@
+---
+- name: Validate Apache capacity
+  ansible.builtin.command: apache2ctl configtest
+  changed_when: false
+  listen: Apply Apache capacity
+
+# ServerLimit requires a full stop/start, not a graceful reload.
+- name: Restart Apache for capacity
+  ansible.builtin.systemd:
+    name: apache2
+    state: restarted
+  listen: Apply Apache capacity

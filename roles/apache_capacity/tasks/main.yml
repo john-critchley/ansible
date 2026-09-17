@@ -1,0 +1,62 @@
+---
+- name: Check active Apache MPM
+  ansible.builtin.command: apache2ctl -M
+  register: apache_modules
+  changed_when: false
+  check_mode: false
+
+- name: Require event MPM for this capacity profile
+  ansible.builtin.assert:
+    that: "'mpm_event_module' in apache_modules.stdout"
+    fail_msg: This profile requires event MPM; do not apply threaded limits to prefork.
+
+- name: Install Apache capacity configuration
+  ansible.builtin.copy:
+    src: capacity.conf
+    dest: /etc/apache2/conf-available/zz-capacity.conf
+    owner: root
+    group: root
+    mode: '0644'
+  notify: Apply Apache capacity
+
+- name: Enable Apache capacity configuration
+  ansible.builtin.file:
+    src: ../conf-available/zz-capacity.conf
+    dest: /etc/apache2/conf-enabled/zz-capacity.conf
+    state: link
+    force: "{{ ansible_check_mode }}"
+  notify: Apply Apache capacity
+
+- name: Enable local status module
+  community.general.apache2_module:
+    name: status
+    state: present
+  notify: Apply Apache capacity
+
+- name: Install worker sampler
+  ansible.builtin.copy:
+    src: apache-worker-sample.py
+    dest: /usr/local/sbin/apache-worker-sample
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Install sampler systemd units
+  ansible.builtin.copy:
+    src: "{{ item }}"
+    dest: "/etc/systemd/system/{{ item }}"
+    owner: root
+    group: root
+    mode: '0644'
+  loop:
+    - apache-worker-sample.service
+    - apache-worker-sample.timer
+  register: apache_sampler_units
+
+- name: Enable worker sampling
+  when: not ansible_check_mode or not apache_sampler_units.changed
+  ansible.builtin.systemd:
+    name: apache-worker-sample.timer
+    enabled: true
+    state: started
+    daemon_reload: "{{ apache_sampler_units.changed }}"

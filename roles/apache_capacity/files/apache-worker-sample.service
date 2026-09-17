@@ -1,0 +1,13 @@
+[Unit]
+Description=Sample Apache worker and scoreboard pressure
+After=apache2.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/apache-worker-sample
+User=nobody
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+TimeoutStartSec=15

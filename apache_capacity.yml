@@ -1,0 +1,8 @@
+---
+# Safe targeted deployment: does not replace existing virtual hosts.
+# ansible-playbook apache_capacity.yml
+- name: Manage Apache worker capacity
+  hosts: "{{ target | default('gravlax') }}"
+  become: true
+  roles:
+    - apache_capacity
