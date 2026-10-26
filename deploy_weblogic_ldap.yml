@@ -90,10 +90,13 @@
     ldap_base:      "dc=critchley,dc=biz"
     controller_ldap_tunnel: "{{ (enable_controller_ldap_tunnel | default(false) | string | lower) in ['1', 'true', 'yes', 'on'] }}"
     controller_ldap_tunnel_port: "{{ ldap_tunnel_local_port | default(1389) }}"
-    # Oracle JDK 21 architecture map (used only when wls_version=14.1.2.0)
+    # Oracle JDK 21 architecture map (used only when wls_version=14.1.2.0).
+    # "latest" always points at the newest JDK release, which has moved past 21,
+    # so these pin an explicit archived build (21.0.12, the newest available
+    # under /java/21/archive/ as of 2026-10-26 — 21.0.13+ 404s there).
     jdk_arch_map:
-      x86_64:  { method: deb,   pkg: "jdk-21_linux-x64_bin.deb",        jvm_path: "" }
-      aarch64: { method: targz, pkg: "jdk-21_linux-aarch64_bin.tar.gz",  jvm_path: "/usr/local/java/oracle-jdk21" }
+      x86_64:  { method: deb,   pkg: "jdk-21.0.12_linux-x64_bin.deb",        jvm_path: "" }
+      aarch64: { method: targz, pkg: "jdk-21.0.12_linux-aarch64_bin.tar.gz",  jvm_path: "/usr/local/java/oracle-jdk21" }
     help_requested: "{{ (help | default(false) | string | lower) in ['1', 'true', 'yes', 'on'] }}"
 
   pre_tasks:
@@ -312,7 +315,7 @@
     # Oracle JDK 21 via download (for wls_version 14.1.2.0)
     - name: Download Oracle JDK 21 (x86 — .deb)
       get_url:
-        url: "https://download.oracle.com/java/21/latest/{{ jdk_arch_map[ansible_architecture].pkg }}"
+        url: "https://download.oracle.com/java/21/archive/{{ jdk_arch_map[ansible_architecture].pkg }}"
         dest: "{{ install_dir }}/{{ jdk_arch_map[ansible_architecture].pkg }}"
         mode: '0644'
         timeout: 600
@@ -325,7 +328,7 @@
 
     - name: Download Oracle JDK 21 (ARM — .tar.gz)
       get_url:
-        url: "https://download.oracle.com/java/21/latest/{{ jdk_arch_map[ansible_architecture].pkg }}"
+        url: "https://download.oracle.com/java/21/archive/{{ jdk_arch_map[ansible_architecture].pkg }}"
         dest: "{{ install_dir }}/{{ jdk_arch_map[ansible_architecture].pkg }}"
         mode: '0644'
         timeout: 600
@@ -889,13 +892,14 @@
       tags: [weblogic, testapp]
 
     - name: Deploy testapp via WLST
-      shell: >
-        export JAVA_HOME="{{ java_home }}" &&
-        export WLS_ADMIN_PASS="{{ wls_admin_pass }}" &&
-        export TESTAPP_WAR="{{ install_dir }}/testapp.war" &&
+      command: >
         {{ oracle_home }}/oracle_common/common/bin/wlst.sh
         {{ install_dir }}/deploy_testapp.py
       become: no
+      environment:
+        JAVA_HOME: "{{ java_home }}"
+        WLS_ADMIN_PASS: "{{ wls_admin_pass }}"
+        TESTAPP_WAR: "{{ install_dir }}/testapp.war"
       when: testapp_check.rc != 0
       timeout: 120
       tags: [weblogic, testapp]
@@ -903,14 +907,15 @@
     # ── 14. Create break-glass emergency user ────────────────────────────────
 
     - name: Create break-glass user in DefaultAuthenticator (idempotent via userExists check)
-      shell: >
-        export JAVA_HOME="{{ java_home }}" &&
-        export WLS_ADMIN_PASS="{{ wls_admin_pass }}" &&
-        export BREAKGLASS_USER="{{ breakglass_user }}" &&
-        export BREAKGLASS_PASS="{{ breakglass_pass }}" &&
+      command: >
         {{ oracle_home }}/oracle_common/common/bin/wlst.sh
         {{ install_dir }}/create_breakglass_user.py
       become: no
+      environment:
+        JAVA_HOME: "{{ java_home }}"
+        WLS_ADMIN_PASS: "{{ wls_admin_pass }}"
+        BREAKGLASS_USER: "{{ breakglass_user }}"
+        BREAKGLASS_PASS: "{{ breakglass_pass }}"
       timeout: 120
       tags: [weblogic, breakglass]
 

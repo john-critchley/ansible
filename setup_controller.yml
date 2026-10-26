@@ -105,7 +105,7 @@
         - not pubkey_stat.stat.exists
         - (target | default('localhost')) != 'localhost'
 
-    - name: Note: SSH private key must be copied manually
+    - name: "Note: SSH private key must be copied manually"
       debug:
         msg:
           - "SSH private key is NOT copied by this playbook (security)."
@@ -174,7 +174,7 @@
         - not item.stat.exists
         - (target | default('localhost')) != 'localhost'
 
-    - name: Note: copy aws scripts manually if running locally
+    - name: "Note: copy aws scripts manually if running locally"
       debug:
         msg: "Copy aws scripts from pomelo: scp ~/aws/awslaunch.py ~/aws/aws_open_port.py ~/aws/awsdecomhost.py <controller>:~/aws/"
       when:
@@ -198,7 +198,7 @@
         - not secrets_stat.stat.exists
         - (target | default('localhost')) != 'localhost'
 
-    - name: Note: copy secrets.yml manually if running locally
+    - name: "Note: copy secrets.yml manually if running locally"
       debug:
         msg: "Copy secrets: scp ~/ansible/secrets.yml <controller>:~/ansible/secrets.yml"
       when:
@@ -212,7 +212,7 @@
         path: "{{ controller_home }}/.aws/credentials"
       register: aws_creds_stat
 
-    - name: Note: AWS credentials must be copied manually
+    - name: "Note: AWS credentials must be copied manually"
       debug:
         msg:
           - "~/.aws/credentials not found."
